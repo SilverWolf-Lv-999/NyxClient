@@ -3,6 +3,10 @@ name = "NyxClient"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "nyx_client"
+path = "src/lib.rs"
+
 [dependencies]
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
