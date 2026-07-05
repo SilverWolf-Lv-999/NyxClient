@@ -1,8 +1,9 @@
 use std::{
-    collections::hash_map::DefaultHasher,
-    ffi::{OsStr, c_void},
+    collections::{HashMap, hash_map::DefaultHasher},
+    ffi::{CStr, OsStr, c_void},
     fs,
     hash::{Hash, Hasher},
+    hint::spin_loop,
     io,
     mem::{size_of, transmute},
     os::windows::ffi::OsStrExt,
@@ -30,18 +31,19 @@ use windows::{
         Graphics::Gdi::{
             AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
             CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-            HGDIOBJ, ReleaseDC, SelectObject,
+            GetDeviceCaps, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SelectObject, VREFRESH,
         },
+        Media::{timeBeginPeriod, timeEndPeriod},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
-            IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, MoveWindow, PostMessageW,
+            DispatchMessageW, GWLP_USERDATA, GetSystemMetrics, GetWindowLongPtrW, IDC_ARROW,
+            LoadCursorW, MA_NOACTIVATE, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
             PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE, SetTimer,
+            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE,
             SetWindowLongPtrW, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
             WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY,
-            WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WM_QUIT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
@@ -50,15 +52,23 @@ use windows::{
 
 const MODULE_NAME: &str = "Live2D";
 const MODEL_VALUE_NAME: &str = "Model";
+const EXPRESSION_VALUE_NAME: &str = "Expression";
 const X_VALUE_NAME: &str = "X";
 const Y_VALUE_NAME: &str = "Y";
 const SCALE_VALUE_NAME: &str = "Scale";
 const ALPHA_VALUE_NAME: &str = "Alpha";
 const MIRROR_VALUE_NAME: &str = "Mirror";
+const FPS_VALUE_NAME: &str = "FPS";
 const NO_MODEL_MODE: &str = "None";
+const NO_EXPRESSION_MODE: &str = "None";
 const STARTING_HWND: isize = -1;
-const FRAME_TIMER_ID: usize = 1;
-const FRAME_TIMER_MS: u32 = 120;
+const FALLBACK_TARGET_FPS: f32 = 165.0;
+const MIN_TARGET_FPS: f32 = 30.0;
+const MAX_TARGET_FPS: f32 = 300.0;
+const FRAME_SLEEP_GUARD: Duration = Duration::from_millis(1);
+const MODEL_FRAME_PADDING: f32 = 32.0;
+const STATUS_FRAME_WIDTH: i32 = 340;
+const STATUS_FRAME_HEIGHT: i32 = 34;
 const MODEL_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_MODEL_JSON_DEPTH: usize = 3;
 const MAX_FINGERPRINT_DEPTH: usize = 6;
@@ -106,6 +116,7 @@ impl Live2D {
             .first()
             .cloned()
             .unwrap_or_else(|| NO_MODEL_MODE.to_owned());
+        let expressions = expression_modes_for_selection(&models, &default_model);
 
         Self {
             info: ModuleInfo::new(
@@ -116,11 +127,18 @@ impl Live2D {
             state: ModuleState::new(),
             values: vec![
                 BaseValue::mode(modes, MODEL_VALUE_NAME, default_model),
+                BaseValue::mode(expressions, EXPRESSION_VALUE_NAME, NO_EXPRESSION_MODE),
                 BaseValue::number(18.0, -4096.0, 4096.0, X_VALUE_NAME),
                 BaseValue::number(72.0, -4096.0, 4096.0, Y_VALUE_NAME),
                 BaseValue::number(0.28, 0.03, 4.0, SCALE_VALUE_NAME),
                 BaseValue::percentage(1.0, 0.0, 1.0, ALPHA_VALUE_NAME),
                 BaseValue::boolean(false, MIRROR_VALUE_NAME),
+                BaseValue::number(
+                    default_target_fps() as f64,
+                    MIN_TARGET_FPS as f64,
+                    MAX_TARGET_FPS as f64,
+                    FPS_VALUE_NAME,
+                ),
             ],
         }
     }
@@ -225,12 +243,15 @@ fn start_model_monitor(modules: SharedModuleHandler) {
 fn monitor_model_directory(modules: SharedModuleHandler) {
     let model_dirs = model_dirs();
     let mut fingerprint = DirectoryFingerprint::default();
+    let mut models = Vec::new();
     loop {
         let next = directories_fingerprint(&model_dirs);
         if next != fingerprint {
             fingerprint = next;
-            let models = scan_model_dirs(&model_dirs);
+            models = scan_model_dirs(&model_dirs);
             update_module_model_modes(&modules, &models);
+        } else {
+            update_module_expression_modes(&modules, &models);
         }
         thread::sleep(MODEL_SCAN_INTERVAL);
     }
@@ -271,8 +292,8 @@ fn run_overlay_window(modules: SharedModuleHandler) -> windows::core::Result<()>
             WS_POPUP,
             screen.x,
             screen.y,
-            screen.width,
-            screen.height,
+            1,
+            1,
             None,
             None,
             Some(hinstance),
@@ -286,11 +307,38 @@ fn run_overlay_window(modules: SharedModuleHandler) -> windows::core::Result<()>
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
+    let _timer_resolution = TimerResolution::begin(1);
     let mut message = MSG::default();
-    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+    let mut next_frame_at = Instant::now();
+    loop {
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() } {
+            if message.message == WM_QUIT {
+                return Ok(());
+            }
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+
+        if OPEN_HWND.load(Ordering::Acquire) != hwnd.0 as isize {
+            break;
+        }
+
+        let now = Instant::now();
+        if now >= next_frame_at {
+            let Some(app) = (unsafe { overlay_app_from_hwnd(hwnd) }) else {
+                break;
+            };
+            let interval = app.frame_interval();
+            app.tick();
+            let after_render = Instant::now();
+            next_frame_at += interval;
+            if next_frame_at <= after_render {
+                next_frame_at = after_render + interval;
+            }
+        } else {
+            sleep_until_frame(next_frame_at, now);
         }
     }
 
@@ -310,6 +358,9 @@ struct OverlayApp {
     loaded_model_key: Option<PathBuf>,
     loaded_model: Option<CubismModel>,
     loaded_model_error: String,
+    last_frame_at: Instant,
+    submitted_frame_cache_key: Option<FrameCacheKey>,
+    uploader: LayeredFrameUploader,
     typeface: Option<Typeface>,
 }
 
@@ -332,6 +383,9 @@ impl OverlayApp {
             loaded_model_key: None,
             loaded_model: None,
             loaded_model_error: String::new(),
+            last_frame_at: Instant::now(),
+            submitted_frame_cache_key: None,
+            uploader: LayeredFrameUploader::default(),
             typeface: match_typeface(),
         }
     }
@@ -339,14 +393,19 @@ impl OverlayApp {
     fn tick(&mut self) {
         if self.should_close() {
             unsafe {
-                let _ = DestroyWindow(self.hwnd);
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
             return;
         }
 
         self.ensure_screen_rect();
         self.refresh_models_if_changed();
+        update_module_expression_modes(&self.modules, &self.models);
         self.render_frame();
+    }
+
+    fn frame_interval(&self) -> Duration {
+        self.overlay_config().frame_interval()
     }
 
     fn should_close(&self) -> bool {
@@ -370,6 +429,8 @@ impl OverlayApp {
         self.loaded_model_key = None;
         self.loaded_model = None;
         self.loaded_model_error.clear();
+        self.last_frame_at = Instant::now();
+        self.submitted_frame_cache_key = None;
     }
 
     fn ensure_screen_rect(&mut self) {
@@ -379,9 +440,7 @@ impl OverlayApp {
         }
 
         self.screen = next;
-        unsafe {
-            let _ = MoveWindow(self.hwnd, next.x, next.y, next.width, next.height, false);
-        }
+        self.submitted_frame_cache_key = None;
     }
 
     fn render_frame(&mut self) {
@@ -389,32 +448,60 @@ impl OverlayApp {
         if !config.enabled {
             return;
         }
+        let now = Instant::now();
+        let delta = now.saturating_duration_since(self.last_frame_at);
+        self.last_frame_at = now;
 
-        let width = self.screen.width.max(1);
-        let height = self.screen.height.max(1);
-        let row_bytes = width as usize * 4;
-        let mut pixels = vec![0_u8; row_bytes * height as usize];
-        let image_info = ImageInfo::new_n32((width, height), AlphaType::Premul, None);
-
-        {
-            let Some(mut surface) =
-                surfaces::wrap_pixels(&image_info, &mut pixels, Some(row_bytes), None)
-            else {
+        if let Some(cache_key) = self.current_frame_cache_key(&config) {
+            if self.submitted_frame_cache_key.as_ref() == Some(&cache_key) {
                 return;
-            };
-            let canvas = surface.canvas();
-            canvas.clear(SkColor::TRANSPARENT);
-            self.draw_overlay(canvas, &config);
+            }
         }
 
-        if let Err(error) = update_layered_pixels(self.hwnd, self.screen, &pixels) {
-            eprintln!("Live2D overlay update failed: {error:?}");
+        let frame = self.build_frame(&config, delta);
+        let cache_key = self.current_frame_cache_key(&config);
+        match self.uploader.update(self.hwnd, frame.rect, &frame.pixels) {
+            Ok(()) => {
+                self.submitted_frame_cache_key = cache_key;
+            }
+            Err(error) => {
+                self.submitted_frame_cache_key = None;
+                eprintln!("Live2D overlay update failed: {error:?}");
+            }
         }
     }
 
-    fn draw_overlay(&mut self, canvas: &Canvas, config: &OverlayConfig) {
+    fn current_frame_cache_key(&self, config: &OverlayConfig) -> Option<FrameCacheKey> {
+        let config_key = FrameConfigKey::from_config(config);
         if config.alpha <= 0.0 || config.selected_model == NO_MODEL_MODE {
-            return;
+            return Some(FrameCacheKey {
+                kind: FrameCacheKind::Transparent,
+                model_key: None,
+                config: config_key,
+                rect: transparent_frame_rect(config),
+            });
+        }
+
+        let model = self.loaded_model.as_ref()?;
+        if !model.frame_cacheable(&config.selected_expression) {
+            return None;
+        }
+
+        let render_width =
+            (model.canvas_width() * config.scale).clamp(16.0, self.screen.width as f32 * 2.0);
+        let render_height =
+            (model.canvas_height() * config.scale).clamp(16.0, self.screen.height as f32 * 2.0);
+        Some(FrameCacheKey {
+            kind: FrameCacheKind::Model,
+            model_key: self.loaded_model_key.clone(),
+            config: config_key,
+            rect: frame_placement(config.x, config.y, render_width, render_height).rect,
+        })
+    }
+
+    fn build_frame(&mut self, config: &OverlayConfig, delta: Duration) -> RenderedFrame {
+        if config.alpha <= 0.0 || config.selected_model == NO_MODEL_MODE {
+            return transparent_frame(config);
         }
 
         let Some(model) = self
@@ -423,8 +510,7 @@ impl OverlayApp {
             .find(|model| model.name == config.selected_model)
             .cloned()
         else {
-            self.draw_status(canvas, config, "No Live2D model selected");
-            return;
+            return self.status_frame(config, "No Live2D model selected");
         };
 
         if !self.ensure_cubism_model(&model) {
@@ -437,41 +523,74 @@ impl OverlayApp {
             } else {
                 "Live2D 模型加载失败".to_owned()
             };
-            self.draw_status(canvas, config, &status);
-            return;
+            return self.status_frame(config, &status);
         }
 
         let Some(core) = self.core.as_ref() else {
-            self.draw_status(canvas, config, "Cubism Core 未加载");
-            return;
+            return self.status_frame(config, "Cubism Core 未加载");
         };
         let Some(model) = self.loaded_model.as_mut() else {
-            self.draw_status(canvas, config, "Live2D 模型未初始化");
-            return;
+            return self.status_frame(config, "Live2D 模型未初始化");
         };
 
+        model.animate(duration_secs(delta), &config.selected_expression);
         if let Err(error) = model.update(core) {
             self.loaded_model_error = format!("Cubism 更新失败: {error}");
-            self.draw_status(canvas, config, &self.loaded_model_error);
-            return;
+            return self.status_frame(config, &self.loaded_model_error);
         }
 
         let render_width =
             (model.canvas_width() * config.scale).clamp(16.0, self.screen.width as f32 * 2.0);
         let render_height =
             (model.canvas_height() * config.scale).clamp(16.0, self.screen.height as f32 * 2.0);
-        model.draw(
-            canvas,
-            config,
-            config.x,
-            config.y,
-            render_width,
-            render_height,
-        );
+        let placement = frame_placement(config.x, config.y, render_width, render_height);
+        let mut frame = blank_frame(placement.rect);
+
+        if frame
+            .with_canvas(|canvas| {
+                canvas.clear(SkColor::TRANSPARENT);
+                model.draw(
+                    canvas,
+                    config,
+                    placement.local_x,
+                    placement.local_y,
+                    render_width,
+                    render_height,
+                );
+            })
+            .is_none()
+        {
+            return transparent_frame(config);
+        }
 
         unsafe {
             (core.reset_drawable_dynamic_flags)(model.model_pointer);
         }
+        frame
+    }
+
+    fn status_frame(&self, config: &OverlayConfig, text: &str) -> RenderedFrame {
+        let mut frame = blank_frame(ScreenRect {
+            x: config.x.floor() as i32,
+            y: config.y.floor() as i32,
+            width: STATUS_FRAME_WIDTH,
+            height: STATUS_FRAME_HEIGHT,
+        });
+
+        if frame
+            .with_canvas(|canvas| {
+                canvas.clear(SkColor::TRANSPARENT);
+                let mut local_config = config.clone();
+                local_config.x = 0.0;
+                local_config.y = 0.0;
+                self.draw_status(canvas, &local_config, text);
+            })
+            .is_none()
+        {
+            return transparent_frame(config);
+        }
+
+        frame
     }
 
     fn ensure_cubism_model(&mut self, model: &Live2DModel) -> bool {
@@ -509,10 +628,12 @@ impl OverlayApp {
         match CubismModel::load(core, model) {
             Ok(cubism_model) => {
                 self.loaded_model = Some(cubism_model);
+                self.submitted_frame_cache_key = None;
                 true
             }
             Err(error) => {
                 self.loaded_model_key = None;
+                self.submitted_frame_cache_key = None;
                 self.loaded_model_error = format!("Cubism 加载失败: {error}");
                 false
             }
@@ -583,11 +704,17 @@ impl OverlayApp {
             .and_then(BaseValue::as_mode)
             .map(|value| value.current_mode().to_owned())
             .unwrap_or_else(|| NO_MODEL_MODE.to_owned());
+        config.selected_expression = module
+            .value(EXPRESSION_VALUE_NAME)
+            .and_then(BaseValue::as_mode)
+            .map(|value| value.current_mode().to_owned())
+            .unwrap_or_else(|| NO_EXPRESSION_MODE.to_owned());
         config.x = number_value(module, X_VALUE_NAME, config.x as f64) as f32;
         config.y = number_value(module, Y_VALUE_NAME, config.y as f64) as f32;
         config.scale = number_value(module, SCALE_VALUE_NAME, config.scale as f64) as f32;
         config.alpha = number_value(module, ALPHA_VALUE_NAME, config.alpha as f64) as f32;
         config.mirror = boolean_value(module, MIRROR_VALUE_NAME, config.mirror);
+        config.target_fps = number_value(module, FPS_VALUE_NAME, config.target_fps as f64) as f32;
         config.sanitize();
         config
     }
@@ -606,12 +733,125 @@ impl OverlayApp {
     }
 }
 
+struct RenderedFrame {
+    rect: ScreenRect,
+    pixels: Vec<u8>,
+    row_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameCacheKey {
+    kind: FrameCacheKind,
+    model_key: Option<PathBuf>,
+    config: FrameConfigKey,
+    rect: ScreenRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameCacheKind {
+    Transparent,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameConfigKey {
+    selected_model: String,
+    selected_expression: String,
+    x: u32,
+    y: u32,
+    scale: u32,
+    alpha: u32,
+    mirror: bool,
+}
+
+impl FrameConfigKey {
+    fn from_config(config: &OverlayConfig) -> Self {
+        Self {
+            selected_model: config.selected_model.clone(),
+            selected_expression: config.selected_expression.clone(),
+            x: f32_cache_bits(config.x),
+            y: f32_cache_bits(config.y),
+            scale: f32_cache_bits(config.scale),
+            alpha: f32_cache_bits(config.alpha),
+            mirror: config.mirror,
+        }
+    }
+}
+
+impl RenderedFrame {
+    fn with_canvas<R>(&mut self, draw: impl FnOnce(&Canvas) -> R) -> Option<R> {
+        let image_info = ImageInfo::new_n32(
+            (self.rect.width.max(1), self.rect.height.max(1)),
+            AlphaType::Premul,
+            None,
+        );
+        let mut surface =
+            surfaces::wrap_pixels(&image_info, &mut self.pixels, Some(self.row_bytes), None)?;
+        Some(draw(surface.canvas()))
+    }
+}
+
+struct FramePlacement {
+    rect: ScreenRect,
+    local_x: f32,
+    local_y: f32,
+}
+
+fn frame_placement(x: f32, y: f32, width: f32, height: f32) -> FramePlacement {
+    let rect_x = (x - MODEL_FRAME_PADDING).floor() as i32;
+    let rect_y = (y - MODEL_FRAME_PADDING).floor() as i32;
+    let local_x = x - rect_x as f32;
+    let local_y = y - rect_y as f32;
+    let rect_width = (local_x + width + MODEL_FRAME_PADDING).ceil().max(1.0) as i32;
+    let rect_height = (local_y + height + MODEL_FRAME_PADDING).ceil().max(1.0) as i32;
+    FramePlacement {
+        rect: ScreenRect {
+            x: rect_x,
+            y: rect_y,
+            width: rect_width,
+            height: rect_height,
+        },
+        local_x,
+        local_y,
+    }
+}
+
+fn blank_frame(rect: ScreenRect) -> RenderedFrame {
+    let width = rect.width.max(1);
+    let height = rect.height.max(1);
+    let row_bytes = width as usize * 4;
+    RenderedFrame {
+        rect: ScreenRect {
+            width,
+            height,
+            ..rect
+        },
+        pixels: vec![0_u8; row_bytes * height as usize],
+        row_bytes,
+    }
+}
+
+fn transparent_frame(config: &OverlayConfig) -> RenderedFrame {
+    blank_frame(transparent_frame_rect(config))
+}
+
+fn transparent_frame_rect(config: &OverlayConfig) -> ScreenRect {
+    ScreenRect {
+        x: config.x.floor() as i32,
+        y: config.y.floor() as i32,
+        width: 1,
+        height: 1,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Live2DModel {
     name: String,
     model_json: Option<PathBuf>,
     moc: Option<PathBuf>,
     textures: Vec<PathBuf>,
+    idle_motions: Vec<MotionSource>,
+    expressions: Vec<ExpressionSource>,
     error: String,
 }
 
@@ -625,14 +865,28 @@ impl Live2DModel {
 }
 
 #[derive(Debug, Clone)]
+struct MotionSource {
+    path: PathBuf,
+    fade_in: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpressionSource {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 struct OverlayConfig {
     enabled: bool,
     selected_model: String,
+    selected_expression: String,
     x: f32,
     y: f32,
     scale: f32,
     alpha: f32,
     mirror: bool,
+    target_fps: f32,
 }
 
 impl Default for OverlayConfig {
@@ -640,11 +894,13 @@ impl Default for OverlayConfig {
         Self {
             enabled: false,
             selected_model: NO_MODEL_MODE.to_owned(),
+            selected_expression: NO_EXPRESSION_MODE.to_owned(),
             x: 18.0,
             y: 72.0,
             scale: 0.28,
             alpha: 1.0,
             mirror: false,
+            target_fps: default_target_fps(),
         }
     }
 }
@@ -655,6 +911,11 @@ impl OverlayConfig {
         self.y = finite_clamp(self.y, -4096.0, 4096.0);
         self.scale = finite_clamp(self.scale, 0.03, 4.0);
         self.alpha = finite_clamp(self.alpha, 0.0, 1.0);
+        self.target_fps = finite_clamp(self.target_fps, MIN_TARGET_FPS, MAX_TARGET_FPS);
+    }
+
+    fn frame_interval(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.target_fps.max(MIN_TARGET_FPS) as f64)
     }
 }
 
@@ -704,6 +965,15 @@ struct CubismCore {
     update_model: CsmModelCall,
     reset_drawable_dynamic_flags: CsmModelCall,
     read_canvas_info: CsmReadCanvasInfo,
+    get_parameter_count: CsmGetInt,
+    get_parameter_ids: CsmGetPointer,
+    get_parameter_values: CsmGetPointer,
+    get_parameter_minimum_values: CsmGetPointer,
+    get_parameter_maximum_values: CsmGetPointer,
+    get_parameter_default_values: CsmGetPointer,
+    get_part_count: Option<CsmGetInt>,
+    get_part_ids: Option<CsmGetPointer>,
+    get_part_opacities: Option<CsmGetPointer>,
     get_drawable_count: CsmGetInt,
     get_drawable_constant_flags: CsmGetPointer,
     get_drawable_dynamic_flags: CsmGetPointer,
@@ -776,6 +1046,31 @@ impl CubismCore {
                 CsmModelCall
             ),
             read_canvas_info: required_core_proc!(library, "csmReadCanvasInfo", CsmReadCanvasInfo),
+            get_parameter_count: required_core_proc!(library, "csmGetParameterCount", CsmGetInt),
+            get_parameter_ids: required_core_proc!(library, "csmGetParameterIds", CsmGetPointer),
+            get_parameter_values: required_core_proc!(
+                library,
+                "csmGetParameterValues",
+                CsmGetPointer
+            ),
+            get_parameter_minimum_values: required_core_proc!(
+                library,
+                "csmGetParameterMinimumValues",
+                CsmGetPointer
+            ),
+            get_parameter_maximum_values: required_core_proc!(
+                library,
+                "csmGetParameterMaximumValues",
+                CsmGetPointer
+            ),
+            get_parameter_default_values: required_core_proc!(
+                library,
+                "csmGetParameterDefaultValues",
+                CsmGetPointer
+            ),
+            get_part_count: optional_core_proc!(library, "csmGetPartCount", CsmGetInt),
+            get_part_ids: optional_core_proc!(library, "csmGetPartIds", CsmGetPointer),
+            get_part_opacities: optional_core_proc!(library, "csmGetPartOpacities", CsmGetPointer),
             get_drawable_count: required_core_proc!(library, "csmGetDrawableCount", CsmGetInt),
             get_drawable_constant_flags: required_core_proc!(
                 library,
@@ -891,12 +1186,387 @@ impl AlignedMemory {
     }
 }
 
+struct TimerResolution {
+    period_ms: u32,
+    active: bool,
+}
+
+impl TimerResolution {
+    fn begin(period_ms: u32) -> Self {
+        let active = unsafe { timeBeginPeriod(period_ms) } == 0;
+        Self { period_ms, active }
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = timeEndPeriod(self.period_ms);
+            }
+        }
+    }
+}
+
+struct ModelParameters {
+    values: *mut f32,
+    default_values: Vec<f32>,
+    minimum_values: Vec<f32>,
+    maximum_values: Vec<f32>,
+    indices: HashMap<String, usize>,
+}
+
+impl ModelParameters {
+    fn load(core: &CubismCore, model_pointer: *mut c_void) -> Self {
+        let count = unsafe { (core.get_parameter_count)(model_pointer) }.max(0) as usize;
+        let values = unsafe { (core.get_parameter_values)(model_pointer) }
+            .cast_mut()
+            .cast::<f32>();
+        let default_values = read_f32_array(
+            unsafe { (core.get_parameter_default_values)(model_pointer) },
+            count,
+            0.0,
+        );
+        let minimum_values = read_f32_array(
+            unsafe { (core.get_parameter_minimum_values)(model_pointer) },
+            count,
+            f32::NEG_INFINITY,
+        );
+        let maximum_values = read_f32_array(
+            unsafe { (core.get_parameter_maximum_values)(model_pointer) },
+            count,
+            f32::INFINITY,
+        );
+        let indices = read_cstring_array(unsafe { (core.get_parameter_ids)(model_pointer) }, count)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+
+        Self {
+            values,
+            default_values,
+            minimum_values,
+            maximum_values,
+            indices,
+        }
+    }
+
+    fn reset_to_defaults(&mut self) {
+        if self.values.is_null() || self.default_values.is_empty() {
+            return;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.default_values.as_ptr(),
+                self.values,
+                self.default_values.len(),
+            );
+        }
+    }
+
+    fn blend_to(&mut self, id: &str, value: f32, weight: f32) {
+        let Some(index) = self.indices.get(id).copied() else {
+            return;
+        };
+        if self.values.is_null() {
+            return;
+        }
+
+        unsafe {
+            let pointer = self.values.add(index);
+            let current = *pointer;
+            *pointer = self.clamp(index, current + (value - current) * weight);
+        }
+    }
+
+    fn add(&mut self, id: &str, value: f32, weight: f32) {
+        let Some(index) = self.indices.get(id).copied() else {
+            return;
+        };
+        if self.values.is_null() {
+            return;
+        }
+
+        unsafe {
+            let pointer = self.values.add(index);
+            *pointer = self.clamp(index, *pointer + value * weight);
+        }
+    }
+
+    fn multiply(&mut self, id: &str, value: f32, weight: f32) {
+        let Some(index) = self.indices.get(id).copied() else {
+            return;
+        };
+        if self.values.is_null() {
+            return;
+        }
+
+        unsafe {
+            let pointer = self.values.add(index);
+            let factor = 1.0 + (value - 1.0) * weight;
+            *pointer = self.clamp(index, *pointer * factor);
+        }
+    }
+
+    fn clamp(&self, index: usize, value: f32) -> f32 {
+        let minimum = self
+            .minimum_values
+            .get(index)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY);
+        let maximum = self
+            .maximum_values
+            .get(index)
+            .copied()
+            .unwrap_or(f32::INFINITY);
+        clamp_finite_range(value, minimum, maximum)
+    }
+}
+
+struct ModelParts {
+    opacities: *mut f32,
+    default_opacities: Vec<f32>,
+    indices: HashMap<String, usize>,
+}
+
+impl ModelParts {
+    fn load(core: &CubismCore, model_pointer: *mut c_void) -> Self {
+        let Some(get_part_count) = core.get_part_count else {
+            return Self::empty();
+        };
+        let Some(get_part_ids) = core.get_part_ids else {
+            return Self::empty();
+        };
+        let Some(get_part_opacities) = core.get_part_opacities else {
+            return Self::empty();
+        };
+
+        let count = unsafe { get_part_count(model_pointer) }.max(0) as usize;
+        let opacities = unsafe { get_part_opacities(model_pointer) }
+            .cast_mut()
+            .cast::<f32>();
+        let default_opacities = read_f32_array(opacities.cast::<c_void>(), count, 1.0);
+        let indices = read_cstring_array(unsafe { get_part_ids(model_pointer) }, count)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+
+        Self {
+            opacities,
+            default_opacities,
+            indices,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            opacities: ptr::null_mut(),
+            default_opacities: Vec::new(),
+            indices: HashMap::new(),
+        }
+    }
+
+    fn reset_to_defaults(&mut self) {
+        if self.opacities.is_null() || self.default_opacities.is_empty() {
+            return;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.default_opacities.as_ptr(),
+                self.opacities,
+                self.default_opacities.len(),
+            );
+        }
+    }
+
+    fn blend_to(&mut self, id: &str, value: f32, weight: f32) {
+        let Some(index) = self.indices.get(id).copied() else {
+            return;
+        };
+        if self.opacities.is_null() {
+            return;
+        }
+
+        unsafe {
+            let pointer = self.opacities.add(index);
+            let current = *pointer;
+            *pointer = finite_clamp(current + (value - current) * weight, 0.0, 1.0);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimationTargetKind {
+    Parameter,
+    PartOpacity,
+    Model,
+}
+
+#[derive(Debug, Clone)]
+struct AnimationTarget {
+    kind: AnimationTargetKind,
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurvePoint {
+    time: f32,
+    value: f32,
+}
+
+#[derive(Debug, Clone)]
+enum CurveSegment {
+    Linear {
+        start: CurvePoint,
+        end: CurvePoint,
+    },
+    Bezier {
+        start: CurvePoint,
+        control1: CurvePoint,
+        control2: CurvePoint,
+        end: CurvePoint,
+    },
+    Stepped {
+        start: CurvePoint,
+        end: CurvePoint,
+    },
+    InverseStepped {
+        end: CurvePoint,
+    },
+}
+
+impl CurveSegment {
+    fn end(&self) -> CurvePoint {
+        match self {
+            Self::Linear { end, .. }
+            | Self::Bezier { end, .. }
+            | Self::Stepped { end, .. }
+            | Self::InverseStepped { end } => *end,
+        }
+    }
+
+    fn contains_time(&self, time: f32) -> bool {
+        time <= self.end().time
+    }
+
+    fn evaluate(&self, time: f32) -> f32 {
+        match self {
+            Self::Linear { start, end } => {
+                let amount = normalized_time(time, start.time, end.time);
+                start.value + (end.value - start.value) * amount
+            }
+            Self::Bezier {
+                start,
+                control1,
+                control2,
+                end,
+            } => evaluate_bezier_value(*start, *control1, *control2, *end, time),
+            Self::Stepped { start, .. } => start.value,
+            Self::InverseStepped { end } => end.value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MotionCurve {
+    target: AnimationTarget,
+    start: CurvePoint,
+    segments: Vec<CurveSegment>,
+}
+
+impl MotionCurve {
+    fn evaluate(&self, time: f32) -> f32 {
+        if time <= self.start.time {
+            return self.start.value;
+        }
+
+        for segment in &self.segments {
+            if segment.contains_time(time) {
+                return segment.evaluate(time);
+            }
+        }
+
+        self.segments
+            .last()
+            .map(CurveSegment::end)
+            .unwrap_or(self.start)
+            .value
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Motion {
+    duration: f32,
+    fade_in: f32,
+    curves: Vec<MotionCurve>,
+}
+
+impl Motion {
+    fn time(&self, elapsed: f32) -> f32 {
+        if self.duration > 0.0 {
+            elapsed % self.duration
+        } else {
+            0.0
+        }
+    }
+
+    fn weight(&self, elapsed: f32) -> f32 {
+        let mut weight: f32 = 1.0;
+        if self.fade_in > 0.0 {
+            weight = weight.min(elapsed / self.fade_in);
+        }
+        finite_clamp(weight, 0.0, 1.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionBlend {
+    Add,
+    Multiply,
+    Overwrite,
+}
+
+#[derive(Debug, Clone)]
+struct ExpressionParameter {
+    id: String,
+    value: f32,
+    blend: ExpressionBlend,
+}
+
+#[derive(Debug, Clone)]
+struct Expression {
+    name: String,
+    fade_in: f32,
+    parameters: Vec<ExpressionParameter>,
+}
+
+impl Expression {
+    fn weight(&self, elapsed: f32) -> f32 {
+        if self.fade_in > 0.0 {
+            finite_clamp(elapsed / self.fade_in, 0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 struct CubismModel {
     _moc_memory: AlignedMemory,
     _model_memory: AlignedMemory,
     _moc_pointer: *mut c_void,
     model_pointer: *mut c_void,
     textures: Vec<Image>,
+    parameters: ModelParameters,
+    parts: ModelParts,
+    idle_motions: Vec<Motion>,
+    expressions: Vec<Expression>,
+    idle_elapsed: f32,
+    active_expression: String,
+    expression_elapsed: f32,
     drawable_count: usize,
     drawable_constant_flags: Vec<u8>,
     drawable_dynamic_flags: *const u8,
@@ -968,6 +1638,19 @@ impl CubismModel {
         if textures.is_empty() {
             return Err("模型没有可用贴图".to_owned());
         }
+
+        let parameters = ModelParameters::load(core, model_pointer);
+        let parts = ModelParts::load(core, model_pointer);
+        let idle_motions = source
+            .idle_motions
+            .iter()
+            .filter_map(|motion| parse_motion(motion).ok())
+            .collect::<Vec<_>>();
+        let expressions = source
+            .expressions
+            .iter()
+            .filter_map(|expression| parse_expression(expression).ok())
+            .collect::<Vec<_>>();
 
         let drawable_count = unsafe { (core.get_drawable_count)(model_pointer) };
         if drawable_count <= 0 {
@@ -1050,6 +1733,13 @@ impl CubismModel {
             _moc_pointer: moc_pointer,
             model_pointer,
             textures,
+            parameters,
+            parts,
+            idle_motions,
+            expressions,
+            idle_elapsed: 0.0,
+            active_expression: NO_EXPRESSION_MODE.to_owned(),
+            expression_elapsed: 0.0,
             drawable_count,
             drawable_constant_flags,
             drawable_dynamic_flags,
@@ -1078,6 +1768,96 @@ impl CubismModel {
         };
         model.update_drawable_order();
         Ok(model)
+    }
+
+    fn animate(&mut self, delta_seconds: f32, selected_expression: &str) {
+        let delta_seconds = if delta_seconds.is_finite() {
+            delta_seconds.clamp(0.0, 0.25)
+        } else {
+            0.0
+        };
+
+        self.parameters.reset_to_defaults();
+        self.parts.reset_to_defaults();
+        self.apply_idle_motion(delta_seconds);
+        self.apply_expression(delta_seconds, selected_expression);
+    }
+
+    fn apply_idle_motion(&mut self, delta_seconds: f32) {
+        let Some(motion) = self.idle_motions.first().cloned() else {
+            return;
+        };
+        self.idle_elapsed += delta_seconds;
+        let time = motion.time(self.idle_elapsed);
+        let weight = motion.weight(self.idle_elapsed);
+        for curve in &motion.curves {
+            let value = curve.evaluate(time);
+            self.apply_motion_target(&curve.target, value, weight);
+        }
+    }
+
+    fn apply_motion_target(&mut self, target: &AnimationTarget, value: f32, weight: f32) {
+        match target.kind {
+            AnimationTargetKind::Parameter => self.parameters.blend_to(&target.id, value, weight),
+            AnimationTargetKind::PartOpacity => self.parts.blend_to(&target.id, value, weight),
+            AnimationTargetKind::Model => {}
+        }
+    }
+
+    fn apply_expression(&mut self, delta_seconds: f32, selected_expression: &str) {
+        let selected_expression = selected_expression.trim();
+        if self.active_expression != selected_expression {
+            self.active_expression = selected_expression.to_owned();
+            self.expression_elapsed = 0.0;
+        }
+        self.expression_elapsed += delta_seconds;
+
+        if selected_expression.is_empty() || selected_expression == NO_EXPRESSION_MODE {
+            return;
+        }
+
+        let Some(expression) = self
+            .expressions
+            .iter()
+            .find(|expression| expression.name == selected_expression)
+            .cloned()
+        else {
+            return;
+        };
+        let weight = expression.weight(self.expression_elapsed);
+        for parameter in &expression.parameters {
+            match parameter.blend {
+                ExpressionBlend::Add => self.parameters.add(&parameter.id, parameter.value, weight),
+                ExpressionBlend::Multiply => {
+                    self.parameters
+                        .multiply(&parameter.id, parameter.value, weight);
+                }
+                ExpressionBlend::Overwrite => {
+                    self.parameters
+                        .blend_to(&parameter.id, parameter.value, weight);
+                }
+            }
+        }
+    }
+
+    fn frame_cacheable(&self, selected_expression: &str) -> bool {
+        if !self.idle_motions.is_empty() {
+            return false;
+        }
+
+        let selected_expression = selected_expression.trim();
+        if selected_expression.is_empty() || selected_expression == NO_EXPRESSION_MODE {
+            return true;
+        }
+        if self.active_expression != selected_expression {
+            return false;
+        }
+
+        self.expressions
+            .iter()
+            .find(|expression| expression.name == selected_expression)
+            .map(|expression| self.expression_elapsed >= expression.fade_in)
+            .unwrap_or(true)
     }
 
     fn update(&mut self, core: &CubismCore) -> Result<(), String> {
@@ -1564,9 +2344,6 @@ unsafe extern "system" fn overlay_window_proc(
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
                     }
                     OPEN_HWND.store(hwnd.0 as isize, Ordering::Release);
-                    unsafe {
-                        let _ = SetTimer(Some(hwnd), FRAME_TIMER_ID, FRAME_TIMER_MS, None);
-                    }
                     return LRESULT(1);
                 }
             }
@@ -1579,15 +2356,6 @@ unsafe extern "system" fn overlay_window_proc(
                 app.render_frame();
             }
             LRESULT(0)
-        }
-        WM_TIMER => {
-            if wparam.0 == FRAME_TIMER_ID {
-                if let Some(app) = unsafe { overlay_app_from_hwnd(hwnd) } {
-                    app.tick();
-                }
-                return LRESULT(0);
-            }
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_CLOSE => {
             unsafe {
@@ -1603,9 +2371,6 @@ unsafe extern "system" fn overlay_window_proc(
         }
         WM_NCDESTROY => {
             let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayApp };
-            unsafe {
-                let _ = KillTimer(Some(hwnd), FRAME_TIMER_ID);
-            }
             if !raw.is_null() {
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1659,6 +2424,8 @@ fn parse_model_folder(folder: &Path) -> Live2DModel {
             model_json: None,
             moc: None,
             textures: Vec::new(),
+            idle_motions: Vec::new(),
+            expressions: Vec::new(),
             error: "No .model3.json found".to_owned(),
         };
     };
@@ -1674,6 +2441,8 @@ fn parse_model_folder(folder: &Path) -> Live2DModel {
             model_json: Some(model_json_path),
             moc: None,
             textures: Vec::new(),
+            idle_motions: Vec::new(),
+            expressions: Vec::new(),
             error: "Failed to parse model3 json".to_owned(),
         };
     };
@@ -1681,6 +2450,8 @@ fn parse_model_folder(folder: &Path) -> Live2DModel {
     let refs = root.get("FileReferences").and_then(JsonValue::as_object);
     let moc = refs.and_then(|refs| resolve_optional(&model_base, refs, "Moc"));
     let textures = refs.map_or_else(Vec::new, |refs| read_textures(&model_base, refs));
+    let idle_motions = refs.map_or_else(Vec::new, |refs| read_idle_motions(&model_base, refs));
+    let expressions = refs.map_or_else(Vec::new, |refs| read_expressions(&model_base, refs));
     let error = if moc.is_none() {
         "model3 missing Moc or moc file does not exist".to_owned()
     } else if textures.is_empty() {
@@ -1694,6 +2465,8 @@ fn parse_model_folder(folder: &Path) -> Live2DModel {
         model_json: Some(model_json_path),
         moc,
         textures,
+        idle_motions,
+        expressions,
         error,
     }
 }
@@ -1713,6 +2486,266 @@ fn read_textures(base: &Path, refs: &JsonMap<String, JsonValue>) -> Vec<PathBuf>
         .map(|relative| safe_resolve(base, relative))
         .filter(|path| path.exists())
         .collect()
+}
+
+fn read_idle_motions(base: &Path, refs: &JsonMap<String, JsonValue>) -> Vec<MotionSource> {
+    let Some(motions) = refs.get("Motions").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    let Some((_, idle_group)) = motions
+        .iter()
+        .find(|(group, _)| group.eq_ignore_ascii_case("Idle"))
+    else {
+        return Vec::new();
+    };
+
+    idle_group
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| read_motion_source(base, entry))
+        .collect()
+}
+
+fn read_motion_source(base: &Path, entry: &JsonValue) -> Option<MotionSource> {
+    let object = entry.as_object()?;
+    let relative = object.get("File").and_then(JsonValue::as_str)?;
+    let path = safe_resolve(base, relative);
+    if !path.exists() {
+        return None;
+    }
+
+    Some(MotionSource {
+        path,
+        fade_in: json_f32(object.get("FadeInTime")),
+    })
+}
+
+fn read_expressions(base: &Path, refs: &JsonMap<String, JsonValue>) -> Vec<ExpressionSource> {
+    refs.get("Expressions")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| read_expression_source(base, entry))
+        .collect()
+}
+
+fn read_expression_source(base: &Path, entry: &JsonValue) -> Option<ExpressionSource> {
+    let object = entry.as_object()?;
+    let relative = object.get("File").and_then(JsonValue::as_str)?;
+    let path = safe_resolve(base, relative);
+    if !path.exists() {
+        return None;
+    }
+
+    let name = object
+        .get("Name")
+        .and_then(JsonValue::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| file_stem_name(&path, "expression"));
+    Some(ExpressionSource { name, path })
+}
+
+fn parse_motion(source: &MotionSource) -> Result<Motion, String> {
+    let content = fs::read_to_string(&source.path)
+        .map_err(|error| format!("读取 motion 失败 {}: {error}", source.path.display()))?;
+    let root = serde_json::from_str::<JsonValue>(&content)
+        .map_err(|error| format!("解析 motion 失败 {}: {error}", source.path.display()))?;
+    let meta = root.get("Meta").and_then(JsonValue::as_object);
+    let duration = meta
+        .and_then(|meta| json_f32(meta.get("Duration")))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let fade_in = source
+        .fade_in
+        .or_else(|| meta.and_then(|meta| json_f32(meta.get("FadeInTime"))))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let curves = root
+        .get("Curves")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_motion_curve)
+        .collect::<Vec<_>>();
+
+    Ok(Motion {
+        duration,
+        fade_in,
+        curves,
+    })
+}
+
+fn parse_motion_curve(value: &JsonValue) -> Option<MotionCurve> {
+    let object = value.as_object()?;
+    let target = parse_animation_target(
+        object.get("Target").and_then(JsonValue::as_str)?,
+        object.get("Id").and_then(JsonValue::as_str)?,
+    )?;
+    let segments_json = object.get("Segments").and_then(JsonValue::as_array)?;
+    let mut numbers = Vec::with_capacity(segments_json.len());
+    for value in segments_json {
+        numbers.push(json_f32(Some(value))?);
+    }
+    if numbers.len() < 2 {
+        return None;
+    }
+
+    let start = CurvePoint {
+        time: numbers[0],
+        value: numbers[1],
+    };
+    let mut current = start;
+    let mut index = 2;
+    let mut segments = Vec::new();
+    while index < numbers.len() {
+        let segment_type = numbers[index].round() as i32;
+        index += 1;
+        match segment_type {
+            0 => {
+                if index + 1 >= numbers.len() {
+                    break;
+                }
+                let end = CurvePoint {
+                    time: numbers[index],
+                    value: numbers[index + 1],
+                };
+                index += 2;
+                segments.push(CurveSegment::Linear {
+                    start: current,
+                    end,
+                });
+                current = end;
+            }
+            1 => {
+                if index + 5 >= numbers.len() {
+                    break;
+                }
+                let control1 = CurvePoint {
+                    time: numbers[index],
+                    value: numbers[index + 1],
+                };
+                let control2 = CurvePoint {
+                    time: numbers[index + 2],
+                    value: numbers[index + 3],
+                };
+                let end = CurvePoint {
+                    time: numbers[index + 4],
+                    value: numbers[index + 5],
+                };
+                index += 6;
+                segments.push(CurveSegment::Bezier {
+                    start: current,
+                    control1,
+                    control2,
+                    end,
+                });
+                current = end;
+            }
+            2 => {
+                if index + 1 >= numbers.len() {
+                    break;
+                }
+                let end = CurvePoint {
+                    time: numbers[index],
+                    value: numbers[index + 1],
+                };
+                index += 2;
+                segments.push(CurveSegment::Stepped {
+                    start: current,
+                    end,
+                });
+                current = end;
+            }
+            3 => {
+                if index + 1 >= numbers.len() {
+                    break;
+                }
+                let end = CurvePoint {
+                    time: numbers[index],
+                    value: numbers[index + 1],
+                };
+                index += 2;
+                segments.push(CurveSegment::InverseStepped { end });
+                current = end;
+            }
+            _ => break,
+        }
+    }
+
+    Some(MotionCurve {
+        target,
+        start,
+        segments,
+    })
+}
+
+fn parse_animation_target(target: &str, id: &str) -> Option<AnimationTarget> {
+    let kind = if target.eq_ignore_ascii_case("Parameter") {
+        AnimationTargetKind::Parameter
+    } else if target.eq_ignore_ascii_case("PartOpacity") {
+        AnimationTargetKind::PartOpacity
+    } else if target.eq_ignore_ascii_case("Model") {
+        AnimationTargetKind::Model
+    } else {
+        return None;
+    };
+    Some(AnimationTarget {
+        kind,
+        id: id.to_owned(),
+    })
+}
+
+fn parse_expression(source: &ExpressionSource) -> Result<Expression, String> {
+    let content = fs::read_to_string(&source.path)
+        .map_err(|error| format!("读取 expression 失败 {}: {error}", source.path.display()))?;
+    let root = serde_json::from_str::<JsonValue>(&content)
+        .map_err(|error| format!("解析 expression 失败 {}: {error}", source.path.display()))?;
+    let fade_in = json_f32(root.get("FadeInTime")).unwrap_or(0.0).max(0.0);
+    let parameters = root
+        .get("Parameters")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_expression_parameter)
+        .collect::<Vec<_>>();
+
+    Ok(Expression {
+        name: source.name.clone(),
+        fade_in,
+        parameters,
+    })
+}
+
+fn parse_expression_parameter(value: &JsonValue) -> Option<ExpressionParameter> {
+    let object = value.as_object()?;
+    let id = object.get("Id").and_then(JsonValue::as_str)?;
+    if id.trim().is_empty() {
+        return None;
+    }
+    let value = json_f32(object.get("Value"))?;
+    let blend = object
+        .get("Blend")
+        .and_then(JsonValue::as_str)
+        .map(parse_expression_blend)
+        .unwrap_or(ExpressionBlend::Add);
+
+    Some(ExpressionParameter {
+        id: id.to_owned(),
+        value,
+        blend,
+    })
+}
+
+fn parse_expression_blend(value: &str) -> ExpressionBlend {
+    if value.eq_ignore_ascii_case("Multiply") {
+        ExpressionBlend::Multiply
+    } else if value.eq_ignore_ascii_case("Overwrite") {
+        ExpressionBlend::Overwrite
+    } else {
+        ExpressionBlend::Add
+    }
 }
 
 fn resolve_optional(base: &Path, refs: &JsonMap<String, JsonValue>, key: &str) -> Option<PathBuf> {
@@ -1833,6 +2866,35 @@ fn update_module_model_modes(modules: &SharedModuleHandler, models: &[Live2DMode
         return;
     };
     mode.set_modes(modes);
+    update_expression_modes_for_module(module, models);
+}
+
+fn update_module_expression_modes(modules: &SharedModuleHandler, models: &[Live2DModel]) {
+    let Ok(mut modules) = modules.lock() else {
+        return;
+    };
+    let Some(module) = modules.get_mut(MODULE_NAME) else {
+        return;
+    };
+    update_expression_modes_for_module(module, models);
+}
+
+fn update_expression_modes_for_module(module: &mut (dyn Module + 'static), models: &[Live2DModel]) {
+    let selected_model = module
+        .value(MODEL_VALUE_NAME)
+        .and_then(BaseValue::as_mode)
+        .map(|value| value.current_mode().to_owned())
+        .unwrap_or_else(|| NO_MODEL_MODE.to_owned());
+    let expression_modes = expression_modes_for_selection(models, &selected_model);
+    let Some(expression_value) = module
+        .value_mut(EXPRESSION_VALUE_NAME)
+        .and_then(BaseValue::as_mode_mut)
+    else {
+        return;
+    };
+    if expression_value.modes() != expression_modes.as_slice() {
+        expression_value.set_modes(expression_modes);
+    }
 }
 
 fn model_modes(models: &[Live2DModel]) -> Vec<String> {
@@ -1841,6 +2903,19 @@ fn model_modes(models: &[Live2DModel]) -> Vec<String> {
     } else {
         models.iter().map(|model| model.name.clone()).collect()
     }
+}
+
+fn expression_modes_for_selection(models: &[Live2DModel], selected_model: &str) -> Vec<String> {
+    let mut modes = vec![NO_EXPRESSION_MODE.to_owned()];
+    if let Some(model) = models.iter().find(|model| model.name == selected_model) {
+        modes.extend(
+            model
+                .expressions
+                .iter()
+                .map(|expression| expression.name.clone()),
+        );
+    }
+    modes
 }
 
 fn live2d_enabled(modules: &SharedModuleHandler) -> bool {
@@ -1886,6 +2961,65 @@ fn lower_file_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_lowercase()
+}
+
+fn file_stem_name(path: &Path, fallback: &str) -> String {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return fallback.to_owned();
+    };
+    let lower_name = file_name.to_lowercase();
+    for suffix in [".motion3.json", ".exp3.json", ".model3.json", ".json"] {
+        if lower_name.ends_with(suffix) && file_name.len() > suffix.len() {
+            return file_name[..file_name.len() - suffix.len()].to_owned();
+        }
+    }
+
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn json_f32(value: Option<&JsonValue>) -> Option<f32> {
+    value
+        .and_then(JsonValue::as_f64)
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+}
+
+fn duration_secs(duration: Duration) -> f32 {
+    duration.as_secs_f32()
+}
+
+fn default_target_fps() -> f32 {
+    let screen_dc = unsafe { GetDC(None) };
+    if screen_dc.0.is_null() {
+        return FALLBACK_TARGET_FPS;
+    }
+
+    let refresh = unsafe { GetDeviceCaps(Some(screen_dc), VREFRESH) };
+    unsafe {
+        let _ = ReleaseDC(None, screen_dc);
+    }
+
+    let fps = if refresh > 1 {
+        refresh as f32
+    } else {
+        FALLBACK_TARGET_FPS
+    };
+    finite_clamp(fps, MIN_TARGET_FPS, MAX_TARGET_FPS)
+}
+
+fn sleep_until_frame(next_frame_at: Instant, now: Instant) {
+    let remaining = next_frame_at.saturating_duration_since(now);
+    if remaining > FRAME_SLEEP_GUARD {
+        thread::sleep(remaining - FRAME_SLEEP_GUARD);
+    } else {
+        while Instant::now() < next_frame_at {
+            spin_loop();
+        }
+    }
 }
 
 fn model_dirs() -> Vec<PathBuf> {
@@ -1980,6 +3114,19 @@ fn load_texture(path: &Path) -> Result<Image, String> {
         fs::read(path).map_err(|error| format!("读取贴图失败 {}: {error}", path.display()))?;
     Image::from_encoded(Data::new_copy(&bytes))
         .ok_or_else(|| format!("贴图解码失败: {}", path.display()))
+}
+
+fn read_cstring_array(pointer: *const c_void, count: usize) -> Vec<String> {
+    read_pointer_array::<i8>(pointer, count)
+        .into_iter()
+        .map(|pointer| {
+            if pointer.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(pointer).to_string_lossy().into_owned() }
+            }
+        })
+        .collect()
 }
 
 fn read_u8_array(pointer: *const c_void, count: usize, fallback: u8) -> Vec<u8> {
@@ -2178,6 +3325,69 @@ fn positive(value: f32, fallback: f32) -> f32 {
     }
 }
 
+fn normalized_time(time: f32, start: f32, end: f32) -> f32 {
+    let duration = end - start;
+    if duration.abs() <= f32::EPSILON {
+        1.0
+    } else {
+        finite_clamp((time - start) / duration, 0.0, 1.0)
+    }
+}
+
+fn evaluate_bezier_value(
+    start: CurvePoint,
+    control1: CurvePoint,
+    control2: CurvePoint,
+    end: CurvePoint,
+    time: f32,
+) -> f32 {
+    if end.time <= start.time {
+        return end.value;
+    }
+
+    let mut low = 0.0_f32;
+    let mut high = 1.0_f32;
+    for _ in 0..16 {
+        let mid = (low + high) * 0.5;
+        let x = cubic_bezier(start.time, control1.time, control2.time, end.time, mid);
+        if x < time {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    let amount = (low + high) * 0.5;
+    cubic_bezier(
+        start.value,
+        control1.value,
+        control2.value,
+        end.value,
+        amount,
+    )
+}
+
+fn cubic_bezier(start: f32, control1: f32, control2: f32, end: f32, amount: f32) -> f32 {
+    let inverse = 1.0 - amount;
+    inverse.powi(3) * start
+        + 3.0 * inverse.powi(2) * amount * control1
+        + 3.0 * inverse * amount.powi(2) * control2
+        + amount.powi(3) * end
+}
+
+fn clamp_finite_range(value: f32, minimum: f32, maximum: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let mut result = value;
+    if minimum.is_finite() {
+        result = result.max(minimum);
+    }
+    if maximum.is_finite() {
+        result = result.min(maximum);
+    }
+    result
+}
+
 fn roaming_app_data_dir() -> PathBuf {
     if let Some(app_data) = std::env::var_os("APPDATA") {
         return ensure_roaming_dir(PathBuf::from(app_data));
@@ -2223,61 +3433,41 @@ fn virtual_screen_rect() -> ScreenRect {
     }
 }
 
-fn update_layered_pixels(
-    hwnd: HWND,
-    screen: ScreenRect,
-    pixels: &[u8],
-) -> windows::core::Result<()> {
-    let width = screen.width.max(1);
-    let height = screen.height.max(1);
-    let mut bitmap_info = BITMAPINFO::default();
-    bitmap_info.bmiHeader = BITMAPINFOHEADER {
-        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width,
-        biHeight: -height,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB.0,
-        biSizeImage: pixels.len() as u32,
-        ..Default::default()
-    };
+#[derive(Default)]
+struct LayeredFrameUploader {
+    memory_dc: Option<HDC>,
+    bitmap: Option<HBITMAP>,
+    previous_object: Option<HGDIOBJ>,
+    bits: *mut c_void,
+    width: i32,
+    height: i32,
+}
 
-    unsafe {
-        let screen_dc = GetDC(None);
+impl LayeredFrameUploader {
+    fn update(
+        &mut self,
+        hwnd: HWND,
+        screen: ScreenRect,
+        pixels: &[u8],
+    ) -> windows::core::Result<()> {
+        let width = screen.width.max(1);
+        let height = screen.height.max(1);
+        self.ensure_bitmap(width, height, pixels.len())?;
+
+        if !self.bits.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits.cast::<u8>(), pixels.len());
+            }
+        }
+
+        let Some(memory_dc) = self.memory_dc else {
+            return Ok(());
+        };
+        let screen_dc = unsafe { GetDC(None) };
         if screen_dc.0.is_null() {
             return Ok(());
         }
 
-        let memory_dc = CreateCompatibleDC(Some(screen_dc));
-        if memory_dc.0.is_null() {
-            let _ = ReleaseDC(None, screen_dc);
-            return Ok(());
-        }
-
-        let mut bits = null_mut::<c_void>();
-        let bitmap_result = CreateDIBSection(
-            Some(screen_dc),
-            &bitmap_info,
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        );
-
-        let bitmap = match bitmap_result {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                let _ = DeleteDC(memory_dc);
-                let _ = ReleaseDC(None, screen_dc);
-                return Err(error);
-            }
-        };
-
-        if !bits.is_null() {
-            ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
-        }
-
-        let previous = SelectObject(memory_dc, HGDIOBJ(bitmap.0));
         let destination = POINT {
             x: screen.x,
             y: screen.y,
@@ -2293,23 +3483,130 @@ fn update_layered_pixels(
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let result = UpdateLayeredWindow(
-            hwnd,
-            Some(screen_dc),
-            Some(&destination),
-            Some(&size),
-            Some(memory_dc),
-            Some(&source),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
+        let result = unsafe {
+            UpdateLayeredWindow(
+                hwnd,
+                Some(screen_dc),
+                Some(&destination),
+                Some(&size),
+                Some(memory_dc),
+                Some(&source),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            )
+        };
 
-        let _ = SelectObject(memory_dc, previous);
-        let _ = DeleteObject(HGDIOBJ(bitmap.0));
-        let _ = DeleteDC(memory_dc);
-        let _ = ReleaseDC(None, screen_dc);
+        unsafe {
+            let _ = ReleaseDC(None, screen_dc);
+        }
         result
+    }
+
+    fn ensure_bitmap(
+        &mut self,
+        width: i32,
+        height: i32,
+        pixel_len: usize,
+    ) -> windows::core::Result<()> {
+        if self.memory_dc.is_some()
+            && self.bitmap.is_some()
+            && !self.bits.is_null()
+            && self.width == width
+            && self.height == height
+        {
+            return Ok(());
+        }
+
+        self.release_bitmap();
+
+        let screen_dc = unsafe { GetDC(None) };
+        if screen_dc.0.is_null() {
+            return Ok(());
+        }
+
+        if self.memory_dc.is_none() {
+            let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+            if memory_dc.0.is_null() {
+                unsafe {
+                    let _ = ReleaseDC(None, screen_dc);
+                }
+                return Ok(());
+            }
+            self.memory_dc = Some(memory_dc);
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: pixel_len as u32,
+            ..Default::default()
+        };
+
+        let mut bits = null_mut::<c_void>();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                Some(screen_dc),
+                &bitmap_info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+        };
+        unsafe {
+            let _ = ReleaseDC(None, screen_dc);
+        }
+
+        let bitmap = bitmap?;
+        let Some(memory_dc) = self.memory_dc else {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            }
+            return Ok(());
+        };
+
+        let previous = unsafe { SelectObject(memory_dc, HGDIOBJ(bitmap.0)) };
+        self.bitmap = Some(bitmap);
+        self.previous_object = Some(previous);
+        self.bits = bits;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    fn release_bitmap(&mut self) {
+        if let Some(memory_dc) = self.memory_dc {
+            if let Some(previous) = self.previous_object.take() {
+                unsafe {
+                    let _ = SelectObject(memory_dc, previous);
+                }
+            }
+        }
+        if let Some(bitmap) = self.bitmap.take() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            }
+        }
+        self.bits = null_mut();
+        self.width = 0;
+        self.height = 0;
+    }
+}
+
+impl Drop for LayeredFrameUploader {
+    fn drop(&mut self) {
+        self.release_bitmap();
+        if let Some(memory_dc) = self.memory_dc.take() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+            }
+        }
     }
 }
 
@@ -2364,6 +3661,16 @@ fn finite_clamp(value: f32, minimum: f32, maximum: f32) -> f32 {
     }
 }
 
+fn f32_cache_bits(value: f32) -> u32 {
+    if value == 0.0 {
+        0.0_f32.to_bits()
+    } else if value.is_nan() {
+        f32::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
 trait NormalizePath {
     fn normalize_path(self) -> PathBuf;
 }
@@ -2394,15 +3701,51 @@ mod tests {
         let models_dir = root.join("models");
         let model_dir = models_dir.join("alpha");
         let texture_dir = model_dir.join("textures");
+        let motion_dir = model_dir.join("motions");
+        let expression_dir = model_dir.join("expressions");
         fs::create_dir_all(&texture_dir).unwrap();
+        fs::create_dir_all(&motion_dir).unwrap();
+        fs::create_dir_all(&expression_dir).unwrap();
         fs::write(model_dir.join("alpha.moc3"), b"moc").unwrap();
         fs::write(texture_dir.join("texture_00.png"), b"png").unwrap();
+        fs::write(
+            motion_dir.join("idle.motion3.json"),
+            r#"{
+                "Meta": { "Duration": 2.0 },
+                "Curves": [
+                    {
+                        "Target": "Parameter",
+                        "Id": "ParamAngleX",
+                        "Segments": [0.0, 0.0, 0, 1.0, 1.0]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            expression_dir.join("smile.exp3.json"),
+            r#"{
+                "FadeInTime": 0.25,
+                "Parameters": [
+                    { "Id": "ParamMouthSmile", "Value": 1.0, "Blend": "Overwrite" }
+                ]
+            }"#,
+        )
+        .unwrap();
         fs::write(
             model_dir.join("alpha.model3.json"),
             r#"{
                 "FileReferences": {
                     "Moc": "alpha.moc3",
-                    "Textures": ["textures/texture_00.png"]
+                    "Textures": ["textures/texture_00.png"],
+                    "Motions": {
+                        "Idle": [
+                            { "File": "motions/idle.motion3.json", "FadeInTime": 0.1 }
+                        ]
+                    },
+                    "Expressions": [
+                        { "Name": "Smile", "File": "expressions/smile.exp3.json" }
+                    ]
                 }
             }"#,
         )
@@ -2414,6 +3757,21 @@ mod tests {
         assert_eq!(models[0].name, "alpha");
         assert!(models[0].valid());
         assert_eq!(models[0].textures.len(), 1);
+        assert_eq!(models[0].idle_motions.len(), 1);
+        assert_eq!(models[0].expressions.len(), 1);
+        assert_eq!(
+            expression_modes_for_selection(&models, "alpha"),
+            vec![NO_EXPRESSION_MODE.to_owned(), "Smile".to_owned()]
+        );
+
+        let motion = parse_motion(&models[0].idle_motions[0]).unwrap();
+        assert_eq!(motion.curves.len(), 1);
+        assert!((motion.curves[0].evaluate(0.5) - 0.5).abs() < f32::EPSILON);
+
+        let expression = parse_expression(&models[0].expressions[0]).unwrap();
+        assert_eq!(expression.name, "Smile");
+        assert_eq!(expression.parameters.len(), 1);
+        assert_eq!(expression.parameters[0].blend, ExpressionBlend::Overwrite);
 
         let _ = fs::remove_dir_all(root);
     }
