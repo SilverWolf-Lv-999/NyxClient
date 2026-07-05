@@ -1,4 +1,8 @@
-use std::{any::TypeId, collections::HashMap};
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use super::{
     event::Event,
@@ -10,9 +14,15 @@ pub struct EventBus {
     handlers: HashMap<TypeId, Vec<EventHandler>>,
 }
 
+pub type SharedEventBus = Arc<Mutex<EventBus>>;
+
 impl EventBus {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn shared() -> SharedEventBus {
+        Arc::new(Mutex::new(Self::new()))
     }
 
     pub fn subscribe<E, F>(&mut self, priority: i32, handler: F) -> HandlerId
@@ -56,6 +66,15 @@ impl EventBus {
             for handler in handlers {
                 handler.handle(event);
             }
+        }
+    }
+
+    pub fn dispatch_shared<E>(event_bus: &SharedEventBus, event: &mut E)
+    where
+        E: Event + 'static,
+    {
+        if let Ok(mut event_bus) = event_bus.lock() {
+            event_bus.dispatch(event);
         }
     }
 }
