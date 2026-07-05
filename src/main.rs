@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod tray_icon;
+
 use nyx_client::{
     event::{
         api::{EventBus, SharedEventBus},
@@ -18,6 +20,7 @@ use nyx_client::{
     },
     modules::{Category, ModuleHandler, ToggleResult},
 };
+use tray_icon::TrayIcon;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RSHIFT};
 
 const KEY_STATE_DOWN_MASK: i16 = 0x8000_u16 as i16;
@@ -25,12 +28,14 @@ const KEY_STATE_DOWN_MASK: i16 = 0x8000_u16 as i16;
 fn main() -> Result<(), String> {
     let mut module_handler = ModuleHandler::with_builtin_modules();
     configure_default_key_binds(&mut module_handler);
+    load_default_config(&mut module_handler);
     print_startup_summary(&module_handler);
 
     let event_bus = EventBus::shared();
     let modules = Arc::new(Mutex::new(module_handler));
     let running = Arc::new(AtomicBool::new(true));
     let pressed_bind_keys = Arc::new(Mutex::new(HashSet::new()));
+    let _tray_icon = TrayIcon::start(Arc::clone(&running))?;
 
     subscribe_runtime_handlers(
         &event_bus,
@@ -44,7 +49,9 @@ fn main() -> Result<(), String> {
     let _hook_publisher = WindowsHookPublisher::start(Arc::clone(&event_bus))
         .map_err(|error| format!("failed to start Windows hook publisher: {error:?}"))?;
 
-    println!("NyxClient running. Press Right Shift to toggle ClickGui. Press Ctrl+C to exit.");
+    println!(
+        "NyxClient running. Press Right Shift to toggle ClickGui. Right-click the tray icon and choose 退出 to exit."
+    );
     run_client_loop(&event_bus, &modules, &pressed_bind_keys, &running);
 
     Ok(())
@@ -56,6 +63,24 @@ fn configure_default_key_binds(module_handler: &mut ModuleHandler) {
             module
                 .state_mut()
                 .set_key_bind(Some(u32::from(VK_RSHIFT.0)));
+        }
+    }
+}
+
+fn load_default_config(module_handler: &mut ModuleHandler) {
+    match module_handler.load_default_config_if_exists() {
+        Ok(true) => {
+            println!(
+                "Loaded default config from {}.",
+                ModuleHandler::default_config_file().display()
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "Failed to load default config from {}: {error}",
+                ModuleHandler::default_config_file().display()
+            );
         }
     }
 }
@@ -208,6 +233,7 @@ fn toggle_bound_modules(modules: &Arc<Mutex<ModuleHandler>>, key_code: u32) -> b
     };
 
     let mut handled = false;
+    let mut should_save_config = false;
     for module in modules.iter_mut() {
         if module.state().key_bind() != Some(key_code) {
             continue;
@@ -216,12 +242,24 @@ fn toggle_bound_modules(modules: &Arc<Mutex<ModuleHandler>>, key_code: u32) -> b
         handled = true;
         let name = module.name();
         if let ToggleResult::Changed {
-            enabled, notify, ..
+            enabled,
+            notify,
+            save_config,
         } = module.toggle()
         {
+            should_save_config |= save_config;
             if notify {
                 println!("{name} {}", if enabled { "enabled" } else { "disabled" });
             }
+        }
+    }
+
+    if should_save_config {
+        if let Err(error) = modules.save_default_config() {
+            eprintln!(
+                "Failed to save default config to {}: {error}",
+                ModuleHandler::default_config_file().display()
+            );
         }
     }
 

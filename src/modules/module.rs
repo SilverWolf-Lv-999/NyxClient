@@ -1,4 +1,10 @@
-use std::fmt;
+use std::{fmt, fs, io, path::PathBuf};
+
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+
+use crate::modules::value::{BaseValue, config_key};
+
+pub const DEFAULT_CONFIG_NAME: &str = "default";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
@@ -181,6 +187,34 @@ pub trait Module: Send {
     fn state(&self) -> &ModuleState;
     fn state_mut(&mut self) -> &mut ModuleState;
 
+    fn values(&self) -> &[BaseValue] {
+        &[]
+    }
+
+    fn values_mut(&mut self) -> &mut [BaseValue] {
+        &mut []
+    }
+
+    fn main_value(&self) -> Option<&BaseValue> {
+        None
+    }
+
+    fn value(&self, key: &str) -> Option<&BaseValue> {
+        let normalized_key = config_key(key);
+        self.values().iter().find(|value| {
+            value.config_key().eq_ignore_ascii_case(&normalized_key)
+                || value.name().eq_ignore_ascii_case(key)
+        })
+    }
+
+    fn value_mut(&mut self, key: &str) -> Option<&mut BaseValue> {
+        let normalized_key = config_key(key);
+        self.values_mut().iter_mut().find(|value| {
+            value.config_key().eq_ignore_ascii_case(&normalized_key)
+                || value.name().eq_ignore_ascii_case(key)
+        })
+    }
+
     fn config_items(&self) -> &[ConfigItem] {
         &[]
     }
@@ -304,5 +338,260 @@ impl ModuleHandler {
 
     pub fn toggle(&mut self, name: &str) -> Option<ToggleResult> {
         self.get_mut(name).map(|module| module.toggle())
+    }
+
+    pub fn config_dir() -> PathBuf {
+        roaming_app_data_dir().join(".nyx_client").join("config")
+    }
+
+    pub fn config_file(config_name: &str) -> PathBuf {
+        let config_name = normalized_config_name(config_name);
+        Self::config_dir().join(format!("{config_name}.json"))
+    }
+
+    pub fn default_config_file() -> PathBuf {
+        Self::config_file(DEFAULT_CONFIG_NAME)
+    }
+
+    pub fn config_exists(config_name: &str) -> bool {
+        Self::config_file(config_name).exists()
+    }
+
+    pub fn default_config_exists() -> bool {
+        Self::config_exists(DEFAULT_CONFIG_NAME)
+    }
+
+    pub fn list_configs() -> io::Result<Vec<String>> {
+        let config_dir = Self::config_dir();
+        if !config_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut configs = Vec::new();
+        for entry in fs::read_dir(config_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                configs.push(stem.to_owned());
+            }
+        }
+        configs.sort();
+        Ok(configs)
+    }
+
+    pub fn save_default_config(&self) -> io::Result<()> {
+        self.save_config(DEFAULT_CONFIG_NAME)
+    }
+
+    pub fn load_default_config(&mut self) -> io::Result<()> {
+        self.load_config(DEFAULT_CONFIG_NAME)
+    }
+
+    pub fn load_default_config_if_exists(&mut self) -> io::Result<bool> {
+        self.load_config_if_exists(DEFAULT_CONFIG_NAME)
+    }
+
+    pub fn save_config(&self, config_name: &str) -> io::Result<()> {
+        let config_file = Self::config_file(config_name);
+        if let Some(parent) = config_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut modules_json = JsonMap::new();
+        for module in self.iter() {
+            let mut module_json = JsonMap::new();
+            module_json.insert("enabled".to_owned(), JsonValue::Bool(module.is_enabled()));
+            module_json.insert(
+                "key".to_owned(),
+                JsonValue::Number(JsonNumber::from(
+                    module.state().key_bind().map(i64::from).unwrap_or(-1),
+                )),
+            );
+
+            let mut values_json = JsonMap::new();
+            for value in module.values() {
+                values_json.insert(
+                    value.config_key(),
+                    JsonValue::String(value.serialize_config_value()),
+                );
+            }
+            if !values_json.is_empty() {
+                module_json.insert("values".to_owned(), JsonValue::Object(values_json));
+            }
+
+            modules_json.insert(config_key(module.name()), JsonValue::Object(module_json));
+        }
+
+        let mut root = JsonMap::new();
+        root.insert("modules".to_owned(), JsonValue::Object(modules_json));
+        let content = serde_json::to_string_pretty(&JsonValue::Object(root))
+            .map_err(|error| io::Error::other(format!("serialize config: {error}")))?;
+        fs::write(config_file, content)
+    }
+
+    pub fn load_config_if_exists(&mut self, config_name: &str) -> io::Result<bool> {
+        if !Self::config_exists(config_name) {
+            return Ok(false);
+        }
+        self.load_config(config_name)?;
+        Ok(true)
+    }
+
+    pub fn load_config(&mut self, config_name: &str) -> io::Result<()> {
+        let config_file = Self::config_file(config_name);
+        let content = fs::read_to_string(&config_file)?;
+        let root = serde_json::from_str::<JsonValue>(&content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse config {}: {error}", config_file.display()),
+            )
+        })?;
+
+        let Some(modules_json) = root.get("modules").and_then(JsonValue::as_object) else {
+            return Ok(());
+        };
+
+        let previous_config_saving = self
+            .iter()
+            .map(|module| module.state().config_saving())
+            .collect::<Vec<_>>();
+        for module in self.iter_mut() {
+            module.state_mut().set_config_saving(false);
+        }
+
+        let result = self.load_modules_from_json(modules_json);
+
+        for (module, config_saving) in self.iter_mut().zip(previous_config_saving) {
+            module.state_mut().set_config_saving(config_saving);
+        }
+
+        result
+    }
+
+    fn load_modules_from_json(
+        &mut self,
+        modules_json: &JsonMap<String, JsonValue>,
+    ) -> io::Result<()> {
+        for module in self.iter_mut() {
+            let Some(module_json) = find_module_config(modules_json, module) else {
+                continue;
+            };
+
+            apply_key_bind(module, module_json);
+            apply_values(module, module_json);
+            apply_enabled(module, module_json);
+        }
+
+        Ok(())
+    }
+}
+
+fn roaming_app_data_dir() -> PathBuf {
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        return PathBuf::from(app_data);
+    }
+
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(user_profile).join("AppData").join("Roaming");
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn normalized_config_name(config_name: &str) -> String {
+    let config_name = config_name.trim();
+    if config_name.is_empty() {
+        DEFAULT_CONFIG_NAME.to_owned()
+    } else {
+        config_name.trim_end_matches(".json").to_owned()
+    }
+}
+
+fn find_module_config<'a>(
+    modules_json: &'a JsonMap<String, JsonValue>,
+    module: &(dyn Module + 'static),
+) -> Option<&'a JsonMap<String, JsonValue>> {
+    find_json_object(modules_json, &config_key(module.name())).or_else(|| {
+        module.config_aliases().iter().find_map(|alias| {
+            if alias.is_empty() {
+                return None;
+            }
+            find_json_object(modules_json, alias)
+                .or_else(|| find_json_object(modules_json, &config_key(alias)))
+        })
+    })
+}
+
+fn find_json_object<'a>(
+    object: &'a JsonMap<String, JsonValue>,
+    key: &str,
+) -> Option<&'a JsonMap<String, JsonValue>> {
+    object.get(key).and_then(JsonValue::as_object).or_else(|| {
+        object
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| value.as_object())
+    })
+}
+
+fn find_json_value<'a>(object: &'a JsonMap<String, JsonValue>, key: &str) -> Option<&'a JsonValue> {
+    object.get(key).or_else(|| {
+        object
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    })
+}
+
+fn apply_key_bind(module: &mut (dyn Module + 'static), module_json: &JsonMap<String, JsonValue>) {
+    let Some(key) = module_json.get("key") else {
+        module.state_mut().set_key_bind(None);
+        return;
+    };
+
+    if let Some(key) = key.as_i64() {
+        module.state_mut().set_key_bind(u32::try_from(key).ok());
+    }
+}
+
+fn apply_values(module: &mut (dyn Module + 'static), module_json: &JsonMap<String, JsonValue>) {
+    let Some(values_json) = module_json.get("values").and_then(JsonValue::as_object) else {
+        return;
+    };
+
+    let pending_values = module
+        .values()
+        .iter()
+        .filter_map(|value| {
+            let value_key = value.config_key();
+            find_json_value(values_json, &value_key)
+                .and_then(json_config_value_to_string)
+                .map(|raw_value| (value_key, raw_value))
+        })
+        .collect::<Vec<_>>();
+
+    for (value_key, raw_value) in pending_values {
+        let normalized_value = module.normalize_config_value(&value_key, &raw_value);
+        if let Some(value) = module.value_mut(&value_key) {
+            let _ = value.deserialize_config_value(&normalized_value);
+        }
+    }
+}
+
+fn apply_enabled(module: &mut (dyn Module + 'static), module_json: &JsonMap<String, JsonValue>) {
+    if let Some(enabled) = module_json.get("enabled").and_then(JsonValue::as_bool) {
+        let _ = module.set_enabled(enabled);
+    }
+}
+
+fn json_config_value_to_string(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) => Some(value.clone()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }

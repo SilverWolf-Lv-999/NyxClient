@@ -7,6 +7,7 @@ name = "NyxClient"
 version = "0.1.0"
 dependencies = [
  "gl",
+ "serde_json",
  "skia-safe",
  "windows",
  "windows-numerics",
