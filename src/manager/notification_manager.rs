@@ -66,6 +66,7 @@ const ERROR_ICON: &[u8] = include_bytes!(concat!(
 
 static GLOBAL_MANAGER: OnceLock<Mutex<NotificationManager>> = OnceLock::new();
 static RENDERING_ENABLED: AtomicBool = AtomicBool::new(true);
+static DESKTOP_FRAME_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static DESKTOP_PRESENTER: RefCell<DesktopNotificationPresenter> =
@@ -688,7 +689,7 @@ pub fn restore_windows_desktop_notifications() -> bool {
 }
 
 pub fn has_windows_desktop_frame() -> bool {
-    DESKTOP_PRESENTER.with(|presenter| presenter.borrow().has_previous_frame())
+    DESKTOP_FRAME_VISIBLE.load(Ordering::Acquire)
 }
 
 pub fn set_rendering_enabled(enabled: bool) {
@@ -988,6 +989,7 @@ impl DesktopRect {
 struct DesktopFrame {
     rect: DesktopRect,
     background_pixels: Vec<u8>,
+    dirty_mask: Vec<u8>,
 }
 
 struct DesktopNotificationPresenter {
@@ -1003,10 +1005,6 @@ impl DesktopNotificationPresenter {
         }
     }
 
-    fn has_previous_frame(&self) -> bool {
-        self.previous_frame.is_some()
-    }
-
     fn render_frame(&mut self, viewport: DesktopViewport) -> bool {
         if viewport.is_empty() || !rendering_enabled() {
             return self.restore_previous();
@@ -1020,21 +1018,21 @@ impl DesktopNotificationPresenter {
         };
 
         let previous_rect = self.previous_frame.as_ref().map(|frame| frame.rect);
-        let _ = self.restore_previous();
-
         let mut render_rect = previous_rect
             .map(|previous| previous.union(current_rect))
             .unwrap_or(current_rect);
         let Some(clipped_rect) = render_rect.intersect(viewport.rect()) else {
-            self.previous_frame = None;
-            return false;
+            return self.restore_previous();
         };
         render_rect = clipped_rect;
 
-        let Some(background_pixels) = capture_screen_rect(render_rect) else {
-            self.previous_frame = None;
+        let Some(mut background_pixels) = capture_screen_rect(render_rect) else {
             return false;
         };
+        if let Some(previous_frame) = self.previous_frame.as_ref() {
+            restore_dirty_pixels(&mut background_pixels, render_rect, previous_frame);
+        }
+
         let mut frame_pixels = background_pixels.clone();
         let row_bytes = render_rect.width as usize * 4;
         let image_info = ImageInfo::new_n32(
@@ -1047,7 +1045,6 @@ impl DesktopNotificationPresenter {
             let Some(mut surface) =
                 surfaces::wrap_pixels(&image_info, &mut frame_pixels, Some(row_bytes), None)
             else {
-                self.previous_frame = None;
                 return false;
             };
             let canvas = surface.canvas();
@@ -1068,7 +1065,31 @@ impl DesktopNotificationPresenter {
         };
 
         if !drew {
-            self.previous_frame = None;
+            if self.previous_frame.is_some() {
+                if blit_pixels_to_screen(render_rect, &background_pixels) {
+                    self.previous_frame = None;
+                    DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
+                    return true;
+                }
+                return false;
+            }
+
+            DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
+            return false;
+        }
+
+        let dirty_mask = dirty_pixel_mask(&background_pixels, &frame_pixels);
+        if !has_dirty_pixels(&dirty_mask) {
+            if self.previous_frame.is_some() {
+                if blit_pixels_to_screen(render_rect, &background_pixels) {
+                    self.previous_frame = None;
+                    DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
+                    return true;
+                }
+                return false;
+            }
+
+            DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
             return false;
         }
 
@@ -1076,19 +1097,93 @@ impl DesktopNotificationPresenter {
             self.previous_frame = Some(DesktopFrame {
                 rect: render_rect,
                 background_pixels,
+                dirty_mask,
             });
+            DESKTOP_FRAME_VISIBLE.store(true, Ordering::Release);
             true
         } else {
-            self.previous_frame = None;
             false
         }
     }
 
     fn restore_previous(&mut self) -> bool {
         let Some(previous_frame) = self.previous_frame.take() else {
+            DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
             return false;
         };
-        blit_pixels_to_screen(previous_frame.rect, &previous_frame.background_pixels)
+
+        let mut restore_pixels = capture_screen_rect(previous_frame.rect)
+            .unwrap_or_else(|| previous_frame.background_pixels.clone());
+        restore_dirty_pixels(&mut restore_pixels, previous_frame.rect, &previous_frame);
+
+        if blit_pixels_to_screen(previous_frame.rect, &restore_pixels) {
+            DESKTOP_FRAME_VISIBLE.store(false, Ordering::Release);
+            true
+        } else {
+            self.previous_frame = Some(previous_frame);
+            DESKTOP_FRAME_VISIBLE.store(true, Ordering::Release);
+            false
+        }
+    }
+}
+
+fn dirty_pixel_mask(background_pixels: &[u8], frame_pixels: &[u8]) -> Vec<u8> {
+    background_pixels
+        .chunks_exact(4)
+        .zip(frame_pixels.chunks_exact(4))
+        .map(|(background, frame)| u8::from(background != frame))
+        .collect()
+}
+
+fn has_dirty_pixels(mask: &[u8]) -> bool {
+    mask.iter().any(|dirty| *dirty != 0)
+}
+
+fn restore_dirty_pixels(
+    dest_pixels: &mut [u8],
+    dest_rect: DesktopRect,
+    previous_frame: &DesktopFrame,
+) {
+    let Some(overlap) = dest_rect.intersect(previous_frame.rect) else {
+        return;
+    };
+
+    let dest_width = dest_rect.width as usize;
+    let previous_width = previous_frame.rect.width as usize;
+    let required_dest_len = dest_width
+        .saturating_mul(dest_rect.height as usize)
+        .saturating_mul(4);
+    let required_previous_len = previous_width.saturating_mul(previous_frame.rect.height as usize);
+    if dest_pixels.len() < required_dest_len
+        || previous_frame.background_pixels.len() < required_previous_len.saturating_mul(4)
+        || previous_frame.dirty_mask.len() < required_previous_len
+    {
+        return;
+    }
+
+    let overlap_width = overlap.width as usize;
+    let overlap_height = overlap.height as usize;
+    let dest_start_x = (overlap.x - dest_rect.x) as usize;
+    let dest_start_y = (overlap.y - dest_rect.y) as usize;
+    let previous_start_x = (overlap.x - previous_frame.rect.x) as usize;
+    let previous_start_y = (overlap.y - previous_frame.rect.y) as usize;
+
+    for row in 0..overlap_height {
+        let dest_row_start = (dest_start_y + row) * dest_width + dest_start_x;
+        let previous_row_start = (previous_start_y + row) * previous_width + previous_start_x;
+
+        for column in 0..overlap_width {
+            let previous_pixel = previous_row_start + column;
+            if previous_frame.dirty_mask[previous_pixel] == 0 {
+                continue;
+            }
+
+            let previous_byte = previous_pixel * 4;
+            let dest_byte = (dest_row_start + column) * 4;
+            dest_pixels[dest_byte..dest_byte + 4].copy_from_slice(
+                &previous_frame.background_pixels[previous_byte..previous_byte + 4],
+            );
+        }
     }
 }
 

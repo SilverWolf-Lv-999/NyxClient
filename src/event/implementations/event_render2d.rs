@@ -26,7 +26,10 @@ use windows::Win32::{
     },
 };
 
-use crate::event::api::{EventBus, SharedEventBus};
+use crate::{
+    event::api::{EventBus, SharedEventBus},
+    manager::notification_manager,
+};
 
 const STOP_MESSAGE: u32 = WM_APP + 0x4E5B;
 const WAKE_MESSAGE: u32 = WM_APP + 0x4E5C;
@@ -492,6 +495,13 @@ fn record_render_change(change: Render2DChange) {
 }
 
 fn flush_due_render_event(force: bool) {
+    if !notification_manager::has_visible_notifications()
+        && !notification_manager::has_windows_desktop_frame()
+    {
+        let _ = take_due_render_event(force);
+        return;
+    }
+
     let Some((event_bus, mut event)) = take_due_render_event(force) else {
         return;
     };
