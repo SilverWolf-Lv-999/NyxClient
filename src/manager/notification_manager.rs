@@ -22,8 +22,8 @@ use windows::Win32::{
         ReleaseDC, SRCCOPY, SelectObject, SetDIBitsToDevice,
     },
     UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+        GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     },
 };
 
@@ -680,7 +680,7 @@ pub fn render_to_windows_desktop(viewport: DesktopViewport) -> bool {
 }
 
 pub fn render_to_current_windows_desktop() -> bool {
-    render_to_windows_desktop(DesktopViewport::current_virtual_screen())
+    render_to_windows_desktop(DesktopViewport::current_primary_screen())
 }
 
 pub fn restore_windows_desktop_notifications() -> bool {
@@ -915,6 +915,16 @@ impl DesktopViewport {
         }
     }
 
+    pub fn current_primary_screen() -> Self {
+        let (width, height) = primary_screen_physical_size();
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
     const fn is_empty(self) -> bool {
         self.width <= 0 || self.height <= 0
     }
@@ -1003,6 +1013,7 @@ impl DesktopNotificationPresenter {
         }
 
         let scale = desktop_notification_scale();
+        debug_desktop_render(viewport, scale);
         let count = manager().lock().map(|manager| manager.len()).unwrap_or(0);
         let Some(current_rect) = notification_desktop_rect(viewport, count, scale) else {
             return self.restore_previous();
@@ -1243,4 +1254,22 @@ fn desktop_dpi_scale() -> f32 {
         let _ = ReleaseDC(None, screen_dc);
     }
     if dpi_x > 0 { dpi_x as f32 / 96.0 } else { 1.0 }
+}
+
+fn primary_screen_physical_size() -> (i32, i32) {
+    (
+        unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1),
+        unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1),
+    )
+}
+
+fn debug_desktop_render(viewport: DesktopViewport, scale: f32) {
+    if std::env::var_os("NYX_NOTIFICATION_DEBUG").is_none() {
+        return;
+    }
+
+    eprintln!(
+        "Notification desktop viewport: x={}, y={}, width={}, height={}, scale={:.2}",
+        viewport.x, viewport.y, viewport.width, viewport.height, scale
+    );
 }

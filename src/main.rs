@@ -34,7 +34,7 @@ use windows::{
     Win32::UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RSHIFT},
         Shell::{IsUserAnAdmin, ShellExecuteW},
-        WindowsAndMessaging::SW_SHOWNORMAL,
+        WindowsAndMessaging::{SW_SHOWNORMAL, SetProcessDPIAware},
     },
     core::{PCWSTR, w},
 };
@@ -131,6 +131,8 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
 }
 
 fn main() -> Result<(), String> {
+    enable_process_dpi_awareness();
+
     if !ensure_elevated()? {
         return Ok(());
     }
@@ -412,4 +414,10 @@ fn toggle_bound_modules(modules: &Arc<Mutex<ModuleHandler>>, key_code: u32) -> b
 
 fn is_key_down(key_code: u32) -> bool {
     unsafe { GetAsyncKeyState(key_code as i32) & KEY_STATE_DOWN_MASK != 0 }
+}
+
+fn enable_process_dpi_awareness() {
+    unsafe {
+        let _ = SetProcessDPIAware();
+    }
 }

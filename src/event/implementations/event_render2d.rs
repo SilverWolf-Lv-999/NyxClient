@@ -6,7 +6,9 @@ use std::{
 
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WAIT_FAILED, WPARAM},
-    System::Threading::{GetCurrentThreadId, INFINITE},
+    Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, VREFRESH},
+    Media::{timeBeginPeriod, timeEndPeriod},
+    System::Threading::GetCurrentThreadId,
     UI::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         WindowsAndMessaging::{
@@ -28,7 +30,10 @@ use crate::event::api::{EventBus, SharedEventBus};
 
 const STOP_MESSAGE: u32 = WM_APP + 0x4E5B;
 const WAKE_MESSAGE: u32 = WM_APP + 0x4E5C;
-const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const FALLBACK_REFRESH_RATE_HZ: u32 = 60;
+const MIN_REFRESH_RATE_HZ: u32 = 30;
+const MAX_REFRESH_RATE_HZ: u32 = 360;
+const REFRESH_RATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 static RENDER_CONTEXT: OnceLock<Mutex<Option<RenderHookContext>>> = OnceLock::new();
 
@@ -39,6 +44,7 @@ pub enum Render2DSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Render2DTrigger {
+    DisplayRefresh,
     SystemForeground,
     SystemMoveSizeStart,
     SystemMoveSizeEnd,
@@ -139,6 +145,19 @@ impl Render2DChange {
             process_id,
         }
     }
+
+    pub const fn display_refresh() -> Self {
+        Self::new(
+            Render2DTrigger::DisplayRefresh,
+            0,
+            0,
+            OBJID_WINDOW.0,
+            CHILDID_SELF as i32,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +170,8 @@ pub struct EventRender2D {
     pub viewport: Render2DViewport,
     pub change: Render2DChange,
     pub coalesced_events: u32,
+    pub refresh_rate_hz: u32,
+    pub target_frame_interval: Duration,
 }
 
 impl EventRender2D {
@@ -160,6 +181,8 @@ impl EventRender2D {
         viewport: Render2DViewport,
         change: Render2DChange,
         coalesced_events: u32,
+        refresh_rate_hz: u32,
+        target_frame_interval: Duration,
     ) -> Self {
         Self {
             source: Render2DSource::WindowsDesktop,
@@ -170,6 +193,8 @@ impl EventRender2D {
             viewport,
             change,
             coalesced_events,
+            refresh_rate_hz,
+            target_frame_interval,
         }
     }
 }
@@ -189,6 +214,7 @@ pub struct WindowsRender2DPublisher {
 
 impl WindowsRender2DPublisher {
     pub fn start(event_bus: SharedEventBus) -> Result<Self, WindowsRender2DError> {
+        let timing = DisplayTiming::current();
         let context = RENDER_CONTEXT.get_or_init(|| Mutex::new(None));
         {
             let mut context = context
@@ -197,7 +223,7 @@ impl WindowsRender2DPublisher {
             if context.is_some() {
                 return Err(WindowsRender2DError::AlreadyRunning);
             }
-            *context = Some(RenderHookContext::new(event_bus));
+            *context = Some(RenderHookContext::new(event_bus, timing));
         }
 
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -253,6 +279,8 @@ impl Drop for WindowsRender2DPublisher {
 struct RenderHookContext {
     event_bus: SharedEventBus,
     thread_id: u32,
+    timing: DisplayTiming,
+    last_refresh_rate_check_at: Instant,
     frame: u64,
     last_frame_at: Option<Instant>,
     pending_change: Option<Render2DChange>,
@@ -260,14 +288,32 @@ struct RenderHookContext {
 }
 
 impl RenderHookContext {
-    fn new(event_bus: SharedEventBus) -> Self {
+    fn new(event_bus: SharedEventBus, timing: DisplayTiming) -> Self {
         Self {
             event_bus,
             thread_id: 0,
+            timing,
+            last_refresh_rate_check_at: Instant::now(),
             frame: 0,
             last_frame_at: None,
             pending_change: None,
             pending_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayTiming {
+    refresh_rate_hz: u32,
+    frame_interval: Duration,
+}
+
+impl DisplayTiming {
+    fn current() -> Self {
+        let refresh_rate_hz = current_refresh_rate_hz();
+        Self {
+            refresh_rate_hz,
+            frame_interval: frame_interval(refresh_rate_hz),
         }
     }
 }
@@ -352,6 +398,7 @@ fn run_render_hook_thread(startup_tx: mpsc::Sender<Result<u32, WindowsRender2DEr
     };
 
     let _ = startup_tx.send(Ok(thread_id));
+    let _timer_resolution = TimerResolution::begin(1);
     render_message_loop();
     flush_due_render_event(true);
     drop(hooks);
@@ -455,19 +502,24 @@ fn take_due_render_event(force: bool) -> Option<(SharedEventBus, EventRender2D)>
     let context = RENDER_CONTEXT.get()?;
     let mut context = context.lock().ok()?;
     let context = context.as_mut()?;
-    if context.pending_count == 0 {
+    if force && context.pending_count == 0 && context.pending_change.is_none() {
         return None;
     }
 
     let now = Instant::now();
+    update_display_timing(context, now);
+
     if !force
         && let Some(last_frame_at) = context.last_frame_at
-        && now.duration_since(last_frame_at) < TARGET_FRAME_INTERVAL
+        && now.duration_since(last_frame_at) < context.timing.frame_interval
     {
         return None;
     }
 
-    let change = context.pending_change.take()?;
+    let change = context
+        .pending_change
+        .take()
+        .unwrap_or_else(Render2DChange::display_refresh);
     let coalesced_events = context.pending_count;
     context.pending_count = 0;
     context.frame = context.frame.wrapping_add(1);
@@ -485,6 +537,8 @@ fn take_due_render_event(force: bool) -> Option<(SharedEventBus, EventRender2D)>
         current_viewport(),
         change,
         coalesced_events,
+        context.timing.refresh_rate_hz,
+        context.timing.frame_interval,
     );
 
     Some((context.event_bus.clone(), event))
@@ -492,33 +546,39 @@ fn take_due_render_event(force: bool) -> Option<(SharedEventBus, EventRender2D)>
 
 fn render_wait_timeout() -> u32 {
     let Some(context) = RENDER_CONTEXT.get() else {
-        return INFINITE;
+        return 0;
     };
     let Ok(context) = context.lock() else {
-        return INFINITE;
+        return 0;
     };
     let Some(context) = context.as_ref() else {
-        return INFINITE;
+        return 0;
     };
-    if context.pending_count == 0 {
-        return INFINITE;
-    }
     let Some(last_frame_at) = context.last_frame_at else {
         return 0;
     };
 
     let elapsed = last_frame_at.elapsed();
-    if elapsed >= TARGET_FRAME_INTERVAL {
+    if elapsed >= context.timing.frame_interval {
         return 0;
     }
 
-    let remaining = TARGET_FRAME_INTERVAL - elapsed;
+    let remaining = context.timing.frame_interval - elapsed;
     let millis = remaining.as_millis();
     if millis == 0 {
         1
     } else {
         millis.min(u128::from(u32::MAX)) as u32
     }
+}
+
+fn update_display_timing(context: &mut RenderHookContext, now: Instant) {
+    if now.duration_since(context.last_refresh_rate_check_at) < REFRESH_RATE_POLL_INTERVAL {
+        return;
+    }
+
+    context.last_refresh_rate_check_at = now;
+    context.timing = DisplayTiming::current();
 }
 
 fn set_context_thread_id(thread_id: u32) -> bool {
@@ -570,4 +630,48 @@ fn current_viewport() -> Render2DViewport {
         unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
         unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
     )
+}
+
+fn current_refresh_rate_hz() -> u32 {
+    let screen_dc = unsafe { GetDC(None) };
+    if screen_dc.0.is_null() {
+        return FALLBACK_REFRESH_RATE_HZ;
+    }
+
+    let refresh = unsafe { GetDeviceCaps(Some(screen_dc), VREFRESH) };
+    unsafe {
+        let _ = ReleaseDC(None, screen_dc);
+    }
+
+    if refresh > 1 {
+        (refresh as u32).clamp(MIN_REFRESH_RATE_HZ, MAX_REFRESH_RATE_HZ)
+    } else {
+        FALLBACK_REFRESH_RATE_HZ
+    }
+}
+
+fn frame_interval(refresh_rate_hz: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(refresh_rate_hz.max(1)))
+}
+
+struct TimerResolution {
+    period_ms: u32,
+    active: bool,
+}
+
+impl TimerResolution {
+    fn begin(period_ms: u32) -> Self {
+        let active = unsafe { timeBeginPeriod(period_ms) } == 0;
+        Self { period_ms, active }
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = timeEndPeriod(self.period_ms);
+            }
+        }
+    }
 }
