@@ -1,0 +1,573 @@
+use std::{
+    sync::{Mutex, OnceLock, mpsc},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime},
+};
+
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, WAIT_FAILED, WPARAM},
+    System::Threading::{GetCurrentThreadId, INFINITE},
+    UI::{
+        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+        WindowsAndMessaging::{
+            CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CONTENTSCROLLED,
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+            GetSystemMetrics, GetWindowThreadProcessId, MSG, MsgWaitForMultipleObjects,
+            OBJID_CLIENT, OBJID_WINDOW, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW,
+            QS_ALLINPUT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN, TranslateMessage, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+            WM_APP, WM_NULL, WM_QUIT,
+        },
+    },
+};
+
+use crate::event::api::{EventBus, SharedEventBus};
+
+const STOP_MESSAGE: u32 = WM_APP + 0x4E5B;
+const WAKE_MESSAGE: u32 = WM_APP + 0x4E5C;
+const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+static RENDER_CONTEXT: OnceLock<Mutex<Option<RenderHookContext>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Render2DSource {
+    WindowsDesktop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Render2DTrigger {
+    SystemForeground,
+    SystemMoveSizeStart,
+    SystemMoveSizeEnd,
+    SystemDesktopSwitch,
+    ObjectCreate,
+    ObjectDestroy,
+    ObjectShow,
+    ObjectHide,
+    ObjectReorder,
+    ObjectStateChange,
+    ObjectLocationChange,
+    ObjectContentScrolled,
+    ObjectCloaked,
+    ObjectUncloaked,
+    Other(u32),
+}
+
+impl Render2DTrigger {
+    pub const fn from_raw_event(event: u32) -> Self {
+        match event {
+            EVENT_SYSTEM_FOREGROUND => Self::SystemForeground,
+            EVENT_SYSTEM_MOVESIZESTART => Self::SystemMoveSizeStart,
+            EVENT_SYSTEM_MOVESIZEEND => Self::SystemMoveSizeEnd,
+            EVENT_SYSTEM_DESKTOPSWITCH => Self::SystemDesktopSwitch,
+            EVENT_OBJECT_CREATE => Self::ObjectCreate,
+            EVENT_OBJECT_DESTROY => Self::ObjectDestroy,
+            EVENT_OBJECT_SHOW => Self::ObjectShow,
+            EVENT_OBJECT_HIDE => Self::ObjectHide,
+            EVENT_OBJECT_REORDER => Self::ObjectReorder,
+            EVENT_OBJECT_STATECHANGE => Self::ObjectStateChange,
+            EVENT_OBJECT_LOCATIONCHANGE => Self::ObjectLocationChange,
+            EVENT_OBJECT_CONTENTSCROLLED => Self::ObjectContentScrolled,
+            EVENT_OBJECT_CLOAKED => Self::ObjectCloaked,
+            EVENT_OBJECT_UNCLOAKED => Self::ObjectUncloaked,
+            other => Self::Other(other),
+        }
+    }
+
+    pub const fn is_visual_update(self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Render2DViewport {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Render2DViewport {
+    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.width <= 0 || self.height <= 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Render2DChange {
+    pub trigger: Render2DTrigger,
+    pub raw_event: u32,
+    pub hwnd: isize,
+    pub object_id: i32,
+    pub child_id: i32,
+    pub event_thread_id: u32,
+    pub event_time: u32,
+    pub process_id: u32,
+}
+
+impl Render2DChange {
+    pub const fn new(
+        trigger: Render2DTrigger,
+        raw_event: u32,
+        hwnd: isize,
+        object_id: i32,
+        child_id: i32,
+        event_thread_id: u32,
+        event_time: u32,
+        process_id: u32,
+    ) -> Self {
+        Self {
+            trigger,
+            raw_event,
+            hwnd,
+            object_id,
+            child_id,
+            event_thread_id,
+            event_time,
+            process_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EventRender2D {
+    pub source: Render2DSource,
+    pub frame: u64,
+    pub delta: Duration,
+    pub timestamp: SystemTime,
+    pub instant: Instant,
+    pub viewport: Render2DViewport,
+    pub change: Render2DChange,
+    pub coalesced_events: u32,
+}
+
+impl EventRender2D {
+    pub fn windows_desktop(
+        frame: u64,
+        delta: Duration,
+        viewport: Render2DViewport,
+        change: Render2DChange,
+        coalesced_events: u32,
+    ) -> Self {
+        Self {
+            source: Render2DSource::WindowsDesktop,
+            frame,
+            delta,
+            timestamp: SystemTime::now(),
+            instant: Instant::now(),
+            viewport,
+            change,
+            coalesced_events,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WindowsRender2DError {
+    AlreadyRunning,
+    ObjectHook(windows::core::Error),
+    SystemHook(windows::core::Error),
+    StartupFailed,
+}
+
+pub struct WindowsRender2DPublisher {
+    thread_id: u32,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WindowsRender2DPublisher {
+    pub fn start(event_bus: SharedEventBus) -> Result<Self, WindowsRender2DError> {
+        let context = RENDER_CONTEXT.get_or_init(|| Mutex::new(None));
+        {
+            let mut context = context
+                .lock()
+                .map_err(|_| WindowsRender2DError::StartupFailed)?;
+            if context.is_some() {
+                return Err(WindowsRender2DError::AlreadyRunning);
+            }
+            *context = Some(RenderHookContext::new(event_bus));
+        }
+
+        let (startup_tx, startup_rx) = mpsc::channel();
+        let worker = match thread::Builder::new()
+            .name("windows-render2d-publisher".to_owned())
+            .spawn(move || run_render_hook_thread(startup_tx))
+        {
+            Ok(worker) => worker,
+            Err(_) => {
+                clear_context();
+                return Err(WindowsRender2DError::StartupFailed);
+            }
+        };
+
+        match startup_rx.recv() {
+            Ok(Ok(thread_id)) => Ok(Self {
+                thread_id,
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                clear_context();
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                clear_context();
+                let _ = worker.join();
+                Err(WindowsRender2DError::StartupFailed)
+            }
+        }
+    }
+
+    pub const fn thread_id(&self) -> u32 {
+        self.thread_id
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, STOP_MESSAGE, WPARAM(0), LPARAM(0));
+            }
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for WindowsRender2DPublisher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct RenderHookContext {
+    event_bus: SharedEventBus,
+    thread_id: u32,
+    frame: u64,
+    last_frame_at: Option<Instant>,
+    pending_change: Option<Render2DChange>,
+    pending_count: u32,
+}
+
+impl RenderHookContext {
+    fn new(event_bus: SharedEventBus) -> Self {
+        Self {
+            event_bus,
+            thread_id: 0,
+            frame: 0,
+            last_frame_at: None,
+            pending_change: None,
+            pending_count: 0,
+        }
+    }
+}
+
+struct InstalledRenderHooks {
+    object: HWINEVENTHOOK,
+    system: HWINEVENTHOOK,
+}
+
+impl InstalledRenderHooks {
+    fn install() -> Result<Self, WindowsRender2DError> {
+        let object = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_UNCLOAKED,
+                None,
+                Some(render_win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if object.is_invalid() {
+            return Err(WindowsRender2DError::ObjectHook(
+                windows::core::Error::from_win32(),
+            ));
+        }
+
+        let system = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_DESKTOPSWITCH,
+                None,
+                Some(render_win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if system.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(object);
+            }
+            return Err(WindowsRender2DError::SystemHook(
+                windows::core::Error::from_win32(),
+            ));
+        }
+
+        Ok(Self { object, system })
+    }
+}
+
+impl Drop for InstalledRenderHooks {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWinEvent(self.object);
+            let _ = UnhookWinEvent(self.system);
+        }
+    }
+}
+
+fn run_render_hook_thread(startup_tx: mpsc::Sender<Result<u32, WindowsRender2DError>>) {
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let mut msg = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut msg, None, WM_NULL, WM_NULL, PM_NOREMOVE);
+    }
+
+    if !set_context_thread_id(thread_id) {
+        let _ = startup_tx.send(Err(WindowsRender2DError::StartupFailed));
+        clear_context();
+        return;
+    }
+
+    let hooks = match InstalledRenderHooks::install() {
+        Ok(hooks) => hooks,
+        Err(error) => {
+            let _ = startup_tx.send(Err(error));
+            clear_context();
+            return;
+        }
+    };
+
+    let _ = startup_tx.send(Ok(thread_id));
+    render_message_loop();
+    flush_due_render_event(true);
+    drop(hooks);
+    clear_context();
+}
+
+fn render_message_loop() {
+    let mut stopping = false;
+
+    while !stopping {
+        let wait_result =
+            unsafe { MsgWaitForMultipleObjects(None, false, render_wait_timeout(), QS_ALLINPUT) };
+        if wait_result == WAIT_FAILED {
+            break;
+        }
+
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() } {
+            if msg.message == STOP_MESSAGE || msg.message == WM_QUIT {
+                stopping = true;
+                break;
+            }
+
+            if msg.message != WAKE_MESSAGE {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+
+        flush_due_render_event(stopping);
+    }
+}
+
+unsafe extern "system" fn render_win_event_proc(
+    _hook: HWINEVENTHOOK,
+    raw_event: u32,
+    hwnd: HWND,
+    object_id: i32,
+    child_id: i32,
+    event_thread_id: u32,
+    event_time: u32,
+) {
+    let trigger = Render2DTrigger::from_raw_event(raw_event);
+    if !trigger.is_visual_update() {
+        return;
+    }
+
+    if is_object_event(raw_event) && !is_render_object(object_id, child_id) {
+        return;
+    }
+
+    let process_id = window_process_id(hwnd);
+    record_render_change(Render2DChange::new(
+        trigger,
+        raw_event,
+        hwnd.0 as isize,
+        object_id,
+        child_id,
+        event_thread_id,
+        event_time,
+        process_id,
+    ));
+}
+
+fn record_render_change(change: Render2DChange) {
+    let Some(context) = RENDER_CONTEXT.get() else {
+        return;
+    };
+
+    let thread_id = {
+        let Ok(mut context) = context.lock() else {
+            return;
+        };
+        let Some(context) = context.as_mut() else {
+            return;
+        };
+
+        context.pending_change = Some(change);
+        context.pending_count = context.pending_count.saturating_add(1);
+        context.thread_id
+    };
+
+    let current_thread_id = unsafe { GetCurrentThreadId() };
+    if thread_id != 0 && thread_id != current_thread_id {
+        unsafe {
+            let _ = PostThreadMessageW(thread_id, WAKE_MESSAGE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn flush_due_render_event(force: bool) {
+    let Some((event_bus, mut event)) = take_due_render_event(force) else {
+        return;
+    };
+    EventBus::dispatch_shared(&event_bus, &mut event);
+}
+
+fn take_due_render_event(force: bool) -> Option<(SharedEventBus, EventRender2D)> {
+    let context = RENDER_CONTEXT.get()?;
+    let mut context = context.lock().ok()?;
+    let context = context.as_mut()?;
+    if context.pending_count == 0 {
+        return None;
+    }
+
+    let now = Instant::now();
+    if !force
+        && let Some(last_frame_at) = context.last_frame_at
+        && now.duration_since(last_frame_at) < TARGET_FRAME_INTERVAL
+    {
+        return None;
+    }
+
+    let change = context.pending_change.take()?;
+    let coalesced_events = context.pending_count;
+    context.pending_count = 0;
+    context.frame = context.frame.wrapping_add(1);
+
+    let delta = context
+        .last_frame_at
+        .map_or(Duration::ZERO, |last_frame_at| {
+            now.duration_since(last_frame_at)
+        });
+    context.last_frame_at = Some(now);
+
+    let event = EventRender2D::windows_desktop(
+        context.frame,
+        delta,
+        current_viewport(),
+        change,
+        coalesced_events,
+    );
+
+    Some((context.event_bus.clone(), event))
+}
+
+fn render_wait_timeout() -> u32 {
+    let Some(context) = RENDER_CONTEXT.get() else {
+        return INFINITE;
+    };
+    let Ok(context) = context.lock() else {
+        return INFINITE;
+    };
+    let Some(context) = context.as_ref() else {
+        return INFINITE;
+    };
+    if context.pending_count == 0 {
+        return INFINITE;
+    }
+    let Some(last_frame_at) = context.last_frame_at else {
+        return 0;
+    };
+
+    let elapsed = last_frame_at.elapsed();
+    if elapsed >= TARGET_FRAME_INTERVAL {
+        return 0;
+    }
+
+    let remaining = TARGET_FRAME_INTERVAL - elapsed;
+    let millis = remaining.as_millis();
+    if millis == 0 {
+        1
+    } else {
+        millis.min(u128::from(u32::MAX)) as u32
+    }
+}
+
+fn set_context_thread_id(thread_id: u32) -> bool {
+    let Some(context) = RENDER_CONTEXT.get() else {
+        return false;
+    };
+    let Ok(mut context) = context.lock() else {
+        return false;
+    };
+    let Some(context) = context.as_mut() else {
+        return false;
+    };
+    context.thread_id = thread_id;
+    true
+}
+
+fn clear_context() {
+    if let Some(context) = RENDER_CONTEXT.get()
+        && let Ok(mut context) = context.lock()
+    {
+        *context = None;
+    }
+}
+
+fn is_object_event(event: u32) -> bool {
+    (EVENT_OBJECT_CREATE..=EVENT_OBJECT_UNCLOAKED).contains(&event)
+}
+
+fn is_render_object(object_id: i32, child_id: i32) -> bool {
+    child_id == CHILDID_SELF as i32 && (object_id == OBJID_WINDOW.0 || object_id == OBJID_CLIENT.0)
+}
+
+fn window_process_id(hwnd: HWND) -> u32 {
+    if hwnd.0.is_null() {
+        return 0;
+    }
+
+    let mut process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    }
+    process_id
+}
+
+fn current_viewport() -> Render2DViewport {
+    Render2DViewport::new(
+        unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+        unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+        unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+        unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+    )
+}

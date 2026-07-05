@@ -2,6 +2,7 @@ pub mod event_command_line;
 pub mod event_keyboard;
 pub mod event_lifecycle;
 pub mod event_mouse;
+pub mod event_render2d;
 pub mod event_tick;
 pub mod event_windows;
 pub mod windows_hook_publisher;
@@ -11,6 +12,10 @@ pub use event_command_line::{CommandLineAction, CommandLineStream, EventCommandL
 pub use event_keyboard::{EventKeyboard, KeyModifiers, KeyState};
 pub use event_lifecycle::{EventLifecycle, LifecyclePhase};
 pub use event_mouse::{EventMouse, MouseAction, MouseButton};
+pub use event_render2d::{
+    EventRender2D, Render2DChange, Render2DSource, Render2DTrigger, Render2DViewport,
+    WindowsRender2DError, WindowsRender2DPublisher,
+};
 pub use event_tick::{EventTick, TickSource};
 pub use event_windows::{EventWindows, WindowsSessionAction};
 pub use windows_hook_publisher::{WindowsHookError, WindowsHookPublisher};

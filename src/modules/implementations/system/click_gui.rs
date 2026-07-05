@@ -13,6 +13,7 @@ use std::{
 
 use crate::{
     client_icon,
+    manager::notification_manager,
     modules::{
         BaseValue, Category, Module, ModuleHandler, ModuleInfo, ModuleState, RgbaColor,
         ToggleResult,
@@ -819,6 +820,7 @@ impl GuiApp {
         drop(modules);
 
         if let Some((name, enabled)) = notification {
+            notification_manager::module_notification(name.as_str(), enabled);
             println!("{name} {}", if enabled { "enabled" } else { "disabled" });
         }
     }

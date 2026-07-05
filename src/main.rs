@@ -21,10 +21,12 @@ use nyx_client::{
     event::{
         api::{EventBus, SharedEventBus},
         implementations::{
-            EventKeyboard, EventLifecycle, EventTick, EventWindows, KeyState, WindowsHookPublisher,
-            WindowsSessionAction, WindowsSessionPublisher,
+            EventKeyboard, EventLifecycle, EventRender2D, EventTick, EventWindows, KeyState,
+            WindowsHookPublisher, WindowsRender2DPublisher, WindowsSessionAction,
+            WindowsSessionPublisher,
         },
     },
+    manager::notification_manager,
     modules::{Category, ModuleHandler, ToggleResult},
 };
 use tray_icon::TrayIcon;
@@ -159,6 +161,8 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("failed to start Windows session publisher: {error:?}"))?;
     let _hook_publisher = WindowsHookPublisher::start(Arc::clone(&event_bus))
         .map_err(|error| format!("failed to start Windows hook publisher: {error:?}"))?;
+    let _render2d_publisher = WindowsRender2DPublisher::start(Arc::clone(&event_bus))
+        .map_err(|error| format!("failed to start Windows Render2D publisher: {error:?}"))?;
 
     println!(
         "NyxClient running. Press Right Shift to toggle ClickGui. Right-click the tray icon and choose 退出 to exit."
@@ -226,11 +230,31 @@ fn subscribe_runtime_handlers(
     let mut event_bus = event_bus
         .lock()
         .map_err(|_| "event bus lock was poisoned during startup".to_owned())?;
+    let desktop_render_dirty = Arc::new(AtomicBool::new(true));
 
     event_bus.subscribe::<EventKeyboard, _>(100, move |event| {
         if handle_key_bind_transition(&modules, &pressed_bind_keys, event.vk_code, event.state) {
             event.cancel();
         }
+    });
+
+    let render_dirty_for_event = Arc::clone(&desktop_render_dirty);
+    event_bus.subscribe::<EventRender2D, _>(50, move |event| {
+        let _ = event;
+        render_dirty_for_event.store(true, Ordering::Release);
+    });
+
+    let render_dirty_for_tick = Arc::clone(&desktop_render_dirty);
+    event_bus.subscribe::<EventTick, _>(-100, move |_event| {
+        let desktop_changed = render_dirty_for_tick.swap(false, Ordering::AcqRel);
+        if !notification_manager::has_visible_notifications()
+            && !notification_manager::has_windows_desktop_frame()
+            && !desktop_changed
+        {
+            return;
+        }
+
+        notification_manager::render_to_current_windows_desktop();
     });
 
     event_bus.subscribe::<EventWindows, _>(100, move |event| {
@@ -243,6 +267,7 @@ fn subscribe_runtime_handlers(
                 | WindowsSessionAction::Shutdown
                 | WindowsSessionAction::EndSession
         ) {
+            notification_manager::restore_windows_desktop_notifications();
             running.store(false, Ordering::Release);
             event.cancel();
         }
@@ -367,6 +392,7 @@ fn toggle_bound_modules(modules: &Arc<Mutex<ModuleHandler>>, key_code: u32) -> b
         {
             should_save_config |= save_config;
             if notify {
+                notification_manager::module_notification(name, enabled);
                 println!("{name} {}", if enabled { "enabled" } else { "disabled" });
             }
         }

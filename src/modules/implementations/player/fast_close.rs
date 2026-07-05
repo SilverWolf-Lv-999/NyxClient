@@ -467,32 +467,12 @@ fn spawn_kill(target_pid: u32) {
     let _ = thread::Builder::new()
         .name("nyx-fast-close-worker".to_owned())
         .spawn(move || {
-            if let Err(error) = kill_process(target_pid, settings) {
+            if let Err(error) =
+                process_utility::kill_process(target_pid, settings.level, settings.process_tree)
+            {
                 eprintln!("FastClose failed to terminate process {target_pid}: {error}");
             }
         });
-}
-
-fn kill_process(target_pid: u32, settings: KillSettings) -> Result<(), String> {
-    match settings.level {
-        ProcessKillLevel::CloseWindows => {
-            process_utility::close_process_windows(target_pid, settings.process_tree).map(|_| ())
-        }
-        ProcessKillLevel::Terminate => {
-            if settings.process_tree {
-                process_utility::terminate_process_tree(target_pid)
-            } else {
-                process_utility::terminate_process(target_pid)
-            }
-        }
-        ProcessKillLevel::Privileged => {
-            if settings.process_tree {
-                process_utility::force_terminate_process_tree(target_pid)
-            } else {
-                process_utility::force_terminate_process(target_pid)
-            }
-        }
-    }
 }
 
 fn is_explorer_process(pid: u32) -> bool {
