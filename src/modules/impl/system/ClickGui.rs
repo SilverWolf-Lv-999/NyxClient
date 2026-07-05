@@ -1,0 +1,1075 @@
+use std::{
+    ffi::c_void,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    ptr::null_mut,
+    sync::atomic::{AtomicIsize, Ordering},
+    thread,
+};
+
+use crate::modules::{Category, Module, ModuleInfo, ModuleState};
+use windows::{
+    Win32::{
+        Foundation::{GENERIC_READ, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::{
+            Direct2D::{
+                Common::{
+                    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+                    D2D1_PIXEL_FORMAT,
+                },
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+                D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory,
+                ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+            },
+            DirectWrite::{
+                DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+                DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWriteCreateFactory,
+                IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+            },
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT},
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+                IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+                WICDecodeMetadataCacheOnLoad,
+            },
+        },
+        System::{
+            Com::Urlmon::URLDownloadToFileW,
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize, IBindStatusCallback,
+            },
+            LibraryLoader::GetModuleHandleW,
+            WindowsProgramming::GetUserNameW,
+        },
+        UI::{
+            Shell::IsUserAnAdmin,
+            WindowsAndMessaging::{
+                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+                DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
+                GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostMessageW,
+                PostQuitMessage, RegisterClassW, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
+                ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
+                WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW,
+                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            },
+        },
+    },
+    core::{IUnknown, PCWSTR, PWSTR, w},
+};
+use windows_numerics::Vector2;
+
+const WINDOW_WIDTH: i32 = 640;
+const WINDOW_HEIGHT: i32 = 440;
+const STARTING_HWND: isize = -1;
+const ICON_URL: &str = "https://raw.githubusercontent.com/github/explore/main/topics/rust/rust.png";
+
+static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+#[derive(Debug)]
+pub struct ClickGui {
+    info: ModuleInfo,
+    state: ModuleState,
+}
+
+impl ClickGui {
+    pub fn new() -> Self {
+        let mut state = ModuleState::new();
+        state.set_config_saving(false);
+
+        Self {
+            info: ModuleInfo::new("ClickGui", "Direct2D powered click GUI.", Category::System),
+            state,
+        }
+    }
+
+    fn reset_toggle_state(&mut self) {
+        let key_bind = self.state.key_bind();
+        self.state = ModuleState::new();
+        self.state.set_key_bind(key_bind);
+        self.state.set_config_saving(false);
+    }
+}
+
+impl Default for ClickGui {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Module for ClickGui {
+    fn info(&self) -> &ModuleInfo {
+        &self.info
+    }
+
+    fn state(&self) -> &ModuleState {
+        &self.state
+    }
+
+    fn state_mut(&mut self) -> &mut ModuleState {
+        &mut self.state
+    }
+
+    fn on_enable(&mut self) {
+        toggle_gui_window();
+        self.reset_toggle_state();
+    }
+
+    fn should_notify_toggle(&self) -> bool {
+        false
+    }
+}
+
+fn toggle_gui_window() {
+    let hwnd_value = OPEN_HWND.load(Ordering::Acquire);
+    if hwnd_value > 0 {
+        let hwnd = HWND(hwnd_value as *mut c_void);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            let _ = SetForegroundWindow(hwnd);
+        }
+        return;
+    }
+
+    if OPEN_HWND
+        .compare_exchange(0, STARTING_HWND, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    if thread::Builder::new()
+        .name("nyx-click-gui".to_owned())
+        .spawn(|| {
+            if let Err(error) = run_gui_window() {
+                eprintln!("ClickGui failed to start: {error:?}");
+                OPEN_HWND.store(0, Ordering::Release);
+            }
+        })
+        .is_err()
+    {
+        OPEN_HWND.store(0, Ordering::Release);
+    }
+}
+
+fn run_gui_window() -> windows::core::Result<()> {
+    let coinit = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    coinit.ok()?;
+    let _com_scope = ComScope;
+
+    let mut app = Box::new(GuiApp::new()?);
+    let app_ptr = app.as_mut() as *mut GuiApp;
+
+    let hmodule = unsafe { GetModuleHandleW(PCWSTR::null())? };
+    let hinstance = HINSTANCE(hmodule.0);
+    let class_name = w!("NyxClientClickGuiWindow");
+
+    let window_class = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(window_proc),
+        hInstance: hinstance,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+
+    unsafe {
+        RegisterClassW(&window_class);
+    }
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            w!("NyxClient ClickGui"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            WINDOW_WIDTH,
+            WINDOW_HEIGHT,
+            None,
+            None,
+            Some(hinstance),
+            Some(app_ptr.cast::<c_void>()),
+        )?
+    };
+
+    let _leaked_to_window = Box::into_raw(app);
+
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    Ok(())
+}
+
+struct ComScope;
+
+impl Drop for ComScope {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+struct GuiApp {
+    hwnd: HWND,
+    d2d_factory: ID2D1Factory,
+    dwrite_factory: IDWriteFactory,
+    wic_factory: IWICImagingFactory,
+    render_target: Option<ID2D1HwndRenderTarget>,
+    icon_bitmap: Option<ID2D1Bitmap>,
+    icon_path: Option<PathBuf>,
+    username: String,
+    is_admin: bool,
+    selected_category: Category,
+    cards: Vec<GuiCard>,
+}
+
+impl GuiApp {
+    fn new() -> windows::core::Result<Self> {
+        let d2d_factory =
+            unsafe { D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
+        let dwrite_factory =
+            unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
+        let wic_factory = unsafe {
+            CoCreateInstance::<_, IWICImagingFactory>(
+                &CLSID_WICImagingFactory,
+                None::<&IUnknown>,
+                CLSCTX_INPROC_SERVER,
+            )?
+        };
+
+        let icon_path = download_icon_to_cache();
+
+        Ok(Self {
+            hwnd: HWND(null_mut()),
+            d2d_factory,
+            dwrite_factory,
+            wic_factory,
+            render_target: None,
+            icon_bitmap: None,
+            icon_path,
+            username: windows_username(),
+            is_admin: unsafe { IsUserAnAdmin().0 != 0 },
+            selected_category: Category::System,
+            cards: seed_cards(),
+        })
+    }
+
+    fn render(&mut self) {
+        if self.ensure_render_target().is_err() {
+            return;
+        }
+        let Some(target) = self.render_target.clone() else {
+            return;
+        };
+        let _ = self.ensure_icon_bitmap();
+
+        unsafe {
+            target.BeginDraw();
+            target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            target.Clear(Some(&color(0.07, 0.08, 0.10, 1.0)));
+        }
+
+        self.draw_shell(&target);
+
+        unsafe {
+            let _ = target.EndDraw(None, None);
+        }
+    }
+
+    fn ensure_render_target(&mut self) -> windows::core::Result<()> {
+        if self.render_target.is_some() {
+            return Ok(());
+        }
+
+        let size = self.client_size();
+        let render_props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 0.0,
+            dpiY: 0.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd: self.hwnd,
+            pixelSize: size,
+            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        };
+
+        self.render_target = Some(unsafe {
+            self.d2d_factory
+                .CreateHwndRenderTarget(&render_props, &hwnd_props)?
+        });
+        Ok(())
+    }
+
+    fn ensure_icon_bitmap(&mut self) -> windows::core::Result<()> {
+        if self.icon_bitmap.is_some() {
+            return Ok(());
+        }
+
+        let Some(path) = self.icon_path.clone() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let Some(target) = &self.render_target else {
+            return Ok(());
+        };
+
+        let path_wide = path_to_wide_null(&path);
+        let decoder = unsafe {
+            self.wic_factory.CreateDecoderFromFilename(
+                PCWSTR(path_wide.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+            )?
+        };
+        let frame = unsafe { decoder.GetFrame(0)? };
+        let converter = unsafe { self.wic_factory.CreateFormatConverter()? };
+        unsafe {
+            converter.Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None::<&IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )?;
+            self.icon_bitmap = Some(target.CreateBitmapFromWicBitmap(&converter, None)?);
+        }
+
+        Ok(())
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        if let Some(target) = &self.render_target {
+            let size = D2D_SIZE_U { width, height };
+            let _ = unsafe { target.Resize(&size) };
+        }
+    }
+
+    fn handle_click(&mut self, x: f32, y: f32) {
+        for (index, category) in Category::ALL.iter().copied().enumerate() {
+            let top = 104.0 + index as f32 * 42.0;
+            if hit(x, y, 18.0, top, 130.0, 34.0) {
+                self.selected_category = category;
+                return;
+            }
+        }
+
+        let mut row = 0;
+        for card in self
+            .cards
+            .iter_mut()
+            .filter(|card| card.category == self.selected_category)
+        {
+            let top = 90.0 + row as f32 * 76.0;
+            if hit(x, y, 552.0, top + 23.0, 44.0, 24.0) {
+                card.enabled = !card.enabled;
+                return;
+            }
+            row += 1;
+        }
+    }
+
+    fn client_size(&self) -> D2D_SIZE_U {
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut rect) }.is_ok() {
+            D2D_SIZE_U {
+                width: (rect.right - rect.left).max(1) as u32,
+                height: (rect.bottom - rect.top).max(1) as u32,
+            }
+        } else {
+            D2D_SIZE_U {
+                width: WINDOW_WIDTH as u32,
+                height: WINDOW_HEIGHT as u32,
+            }
+        }
+    }
+
+    fn draw_shell(&self, target: &ID2D1HwndRenderTarget) {
+        let size = self.client_size();
+        let width = size.width as f32;
+        let height = size.height as f32;
+
+        self.fill_round(
+            target,
+            rect(14.0, 14.0, width - 14.0, height - 14.0),
+            16.0,
+            rgba(16, 18, 23, 255),
+        );
+        self.fill_round(
+            target,
+            rect(20.0, 20.0, 166.0, height - 20.0),
+            13.0,
+            rgba(22, 25, 31, 255),
+        );
+        self.fill_round(
+            target,
+            rect(176.0, 20.0, width - 20.0, height - 20.0),
+            13.0,
+            rgba(19, 22, 29, 255),
+        );
+
+        self.draw_brand(target);
+        self.draw_categories(target);
+        self.draw_profile(target, height);
+        self.draw_content(target, width);
+    }
+
+    fn draw_brand(&self, target: &ID2D1HwndRenderTarget) {
+        self.fill_round(
+            target,
+            rect(34.0, 34.0, 70.0, 70.0),
+            9.0,
+            rgba(36, 43, 55, 255),
+        );
+        if let Some(bitmap) = &self.icon_bitmap {
+            unsafe {
+                target.DrawBitmap(
+                    bitmap,
+                    Some(&rect(38.0, 38.0, 66.0, 66.0)),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        } else {
+            self.fill_round(
+                target,
+                rect(38.0, 38.0, 66.0, 66.0),
+                8.0,
+                rgba(224, 118, 50, 255),
+            );
+            self.text(
+                target,
+                "N",
+                38.0,
+                38.0,
+                66.0,
+                64.0,
+                16.0,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                rgba(255, 255, 255, 255),
+            );
+        }
+        self.text(
+            target,
+            "Nyx",
+            82.0,
+            35.0,
+            150.0,
+            55.0,
+            18.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            rgba(240, 244, 248, 255),
+        );
+        self.text(
+            target,
+            "Client",
+            82.0,
+            56.0,
+            150.0,
+            72.0,
+            11.0,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            rgba(133, 146, 166, 255),
+        );
+    }
+
+    fn draw_categories(&self, target: &ID2D1HwndRenderTarget) {
+        for (index, category) in Category::ALL.iter().copied().enumerate() {
+            let top = 104.0 + index as f32 * 42.0;
+            let selected = category == self.selected_category;
+            let bg = if selected {
+                rgba(54, 95, 132, 255)
+            } else {
+                rgba(27, 31, 39, 255)
+            };
+            let fg = if selected {
+                rgba(248, 251, 255, 255)
+            } else {
+                rgba(153, 166, 186, 255)
+            };
+            self.fill_round(target, rect(18.0, top, 148.0, top + 34.0), 8.0, bg);
+            self.text(
+                target,
+                category.display_name(),
+                44.0,
+                top + 7.0,
+                138.0,
+                top + 28.0,
+                13.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                fg,
+            );
+            self.fill_round(target, rect(28.0, top + 12.0, 36.0, top + 20.0), 4.0, fg);
+        }
+    }
+
+    fn draw_profile(&self, target: &ID2D1HwndRenderTarget, height: f32) {
+        let top = height - 82.0;
+        self.fill_round(
+            target,
+            rect(30.0, top, 156.0, top + 50.0),
+            12.0,
+            rgba(28, 33, 42, 255),
+        );
+
+        let avatar = D2D1_ELLIPSE {
+            point: Vector2 {
+                X: 54.0,
+                Y: top + 25.0,
+            },
+            radiusX: 16.0,
+            radiusY: 16.0,
+        };
+        if let Ok(brush) = self.brush(target, rgba(65, 122, 159, 255)) {
+            unsafe {
+                target.FillEllipse(&avatar, &brush);
+            }
+        }
+
+        let initial = self
+            .username
+            .chars()
+            .next()
+            .map(|ch| ch.to_uppercase().to_string())
+            .unwrap_or_else(|| "U".to_owned());
+        self.text(
+            target,
+            &initial,
+            38.0,
+            top + 8.0,
+            70.0,
+            top + 38.0,
+            15.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            rgba(255, 255, 255, 255),
+        );
+        self.text(
+            target,
+            &self.username,
+            78.0,
+            top + 8.0,
+            146.0,
+            top + 26.0,
+            12.0,
+            DWRITE_FONT_WEIGHT_DEMI_BOLD,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            rgba(236, 241, 247, 255),
+        );
+
+        if self.is_admin {
+            self.fill_round(
+                target,
+                rect(78.0, top + 28.0, 112.0, top + 44.0),
+                7.0,
+                rgba(194, 80, 69, 255),
+            );
+            self.text(
+                target,
+                "Dev",
+                78.0,
+                top + 28.0,
+                112.0,
+                top + 42.0,
+                9.0,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                rgba(255, 255, 255, 255),
+            );
+        } else {
+            self.text(
+                target,
+                "User",
+                78.0,
+                top + 28.0,
+                120.0,
+                top + 44.0,
+                10.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                rgba(122, 137, 157, 255),
+            );
+        }
+    }
+
+    fn draw_content(&self, target: &ID2D1HwndRenderTarget, width: f32) {
+        self.text(
+            target,
+            self.selected_category.display_name(),
+            204.0,
+            42.0,
+            width - 38.0,
+            70.0,
+            22.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            rgba(245, 248, 252, 255),
+        );
+        self.text(
+            target,
+            "Direct2D module surface",
+            204.0,
+            68.0,
+            width - 38.0,
+            88.0,
+            12.0,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            rgba(137, 151, 171, 255),
+        );
+
+        for (row, card) in self
+            .cards
+            .iter()
+            .filter(|card| card.category == self.selected_category)
+            .enumerate()
+        {
+            let top = 94.0 + row as f32 * 76.0;
+            self.fill_round(
+                target,
+                rect(204.0, top, width - 38.0, top + 62.0),
+                10.0,
+                rgba(28, 33, 42, 255),
+            );
+            self.stroke_round(
+                target,
+                rect(204.0, top, width - 38.0, top + 62.0),
+                10.0,
+                rgba(42, 49, 61, 255),
+                1.0,
+            );
+            self.text(
+                target,
+                card.name,
+                222.0,
+                top + 10.0,
+                width - 98.0,
+                top + 30.0,
+                14.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                rgba(237, 242, 248, 255),
+            );
+            self.text(
+                target,
+                card.description,
+                222.0,
+                top + 33.0,
+                width - 98.0,
+                top + 52.0,
+                11.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                rgba(133, 148, 168, 255),
+            );
+            self.draw_switch(target, width - 86.0, top + 20.0, card.enabled);
+        }
+    }
+
+    fn draw_switch(&self, target: &ID2D1HwndRenderTarget, left: f32, top: f32, enabled: bool) {
+        let bg = if enabled {
+            rgba(70, 138, 105, 255)
+        } else {
+            rgba(58, 65, 77, 255)
+        };
+        self.fill_round(target, rect(left, top, left + 44.0, top + 24.0), 12.0, bg);
+        let knob_x = if enabled { left + 31.0 } else { left + 13.0 };
+        let ellipse = D2D1_ELLIPSE {
+            point: Vector2 {
+                X: knob_x,
+                Y: top + 12.0,
+            },
+            radiusX: 8.0,
+            radiusY: 8.0,
+        };
+        if let Ok(brush) = self.brush(target, rgba(250, 252, 255, 255)) {
+            unsafe {
+                target.FillEllipse(&ellipse, &brush);
+            }
+        }
+    }
+
+    fn text(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        value: &str,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        size: f32,
+        weight: DWRITE_FONT_WEIGHT,
+        align: DWRITE_TEXT_ALIGNMENT,
+        text_color: D2D1_COLOR_F,
+    ) {
+        let Some(format) = self.text_format(size, weight, align) else {
+            return;
+        };
+        let Ok(brush) = self.brush(target, text_color) else {
+            return;
+        };
+        let wide: Vec<u16> = value.encode_utf16().collect();
+        if wide.is_empty() {
+            return;
+        }
+
+        unsafe {
+            target.DrawText(
+                &wide,
+                &format,
+                &rect(left, top, right, bottom),
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    fn text_format(
+        &self,
+        size: f32,
+        weight: DWRITE_FONT_WEIGHT,
+        align: DWRITE_TEXT_ALIGNMENT,
+    ) -> Option<IDWriteTextFormat> {
+        let format = unsafe {
+            self.dwrite_factory
+                .CreateTextFormat(
+                    w!("Segoe UI"),
+                    None::<&IDWriteFontCollection>,
+                    weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    size,
+                    w!("en-us"),
+                )
+                .ok()?
+        };
+        unsafe {
+            let _ = format.SetTextAlignment(align);
+            let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        Some(format)
+    }
+
+    fn fill_round(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        area: D2D_RECT_F,
+        radius: f32,
+        fill: D2D1_COLOR_F,
+    ) {
+        if let Ok(brush) = self.brush(target, fill) {
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: area,
+                radiusX: radius,
+                radiusY: radius,
+            };
+            unsafe {
+                target.FillRoundedRectangle(&rounded, &brush);
+            }
+        }
+    }
+
+    fn stroke_round(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        area: D2D_RECT_F,
+        radius: f32,
+        stroke: D2D1_COLOR_F,
+        width: f32,
+    ) {
+        if let Ok(brush) = self.brush(target, stroke) {
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: area,
+                radiusX: radius,
+                radiusY: radius,
+            };
+            unsafe {
+                target.DrawRoundedRectangle(&rounded, &brush, width, None::<&ID2D1StrokeStyle>);
+            }
+        }
+    }
+
+    fn brush(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+        brush_color: D2D1_COLOR_F,
+    ) -> windows::core::Result<ID2D1SolidColorBrush> {
+        unsafe { target.CreateSolidColorBrush(&brush_color, None) }
+    }
+}
+
+struct GuiCard {
+    category: Category,
+    name: &'static str,
+    description: &'static str,
+    enabled: bool,
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_NCCREATE => {
+            let create = lparam.0 as *const CREATESTRUCTW;
+            if !create.is_null() {
+                let app_ptr = unsafe { (*create).lpCreateParams as *mut GuiApp };
+                if !app_ptr.is_null() {
+                    unsafe {
+                        (*app_ptr).hwnd = hwnd;
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
+                    }
+                    OPEN_HWND.store(hwnd.0 as isize, Ordering::Release);
+                    return LRESULT(1);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            unsafe {
+                BeginPaint(hwnd, &mut paint);
+            }
+            if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                app.render();
+            }
+            unsafe {
+                let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SIZE => {
+            if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                let width = (lparam.0 as u32 & 0xffff).max(1);
+                let height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
+                app.resize(width, height);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                let x = (lparam.0 as u32 & 0xffff) as i16 as f32;
+                let y = ((lparam.0 as u32 >> 16) & 0xffff) as i16 as f32;
+                app.handle_click(x, y);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GuiApp };
+            if !raw.is_null() {
+                unsafe {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    drop(Box::from_raw(raw));
+                }
+            }
+            OPEN_HWND.store(0, Ordering::Release);
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+unsafe fn app_from_hwnd(hwnd: HWND) -> Option<&'static mut GuiApp> {
+    let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GuiApp };
+    if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *raw })
+    }
+}
+
+fn seed_cards() -> Vec<GuiCard> {
+    vec![
+        GuiCard {
+            category: Category::Combat,
+            name: "Aim Assist",
+            description: "Smooth target assistance preview.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Combat,
+            name: "Reach",
+            description: "Extended interaction display card.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Other,
+            name: "Fun",
+            description: "Base module for other features.",
+            enabled: true,
+        },
+        GuiCard {
+            category: Category::Other,
+            name: "Streamer Mode",
+            description: "Hide identifying overlay data.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Player,
+            name: "Inventory Move",
+            description: "Player movement utility placeholder.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Player,
+            name: "No Slow",
+            description: "Movement quality-of-life display.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::System,
+            name: "ClickGui",
+            description: "Rust Direct2D click interface.",
+            enabled: true,
+        },
+        GuiCard {
+            category: Category::System,
+            name: "Config",
+            description: "Local configuration surface.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Visual,
+            name: "HUD",
+            description: "On-screen client information.",
+            enabled: false,
+        },
+        GuiCard {
+            category: Category::Visual,
+            name: "ESP",
+            description: "Visual module display card.",
+            enabled: false,
+        },
+    ]
+}
+
+fn download_icon_to_cache() -> Option<PathBuf> {
+    let mut path = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    path.push("NyxClient");
+    let _ = std::fs::create_dir_all(&path);
+    path.push("clickgui-icon.png");
+
+    if path.exists() {
+        return Some(path);
+    }
+
+    let url = wide_null(ICON_URL);
+    let dest = path_to_wide_null(&path);
+    let result = unsafe {
+        URLDownloadToFileW(
+            None::<&IUnknown>,
+            PCWSTR(url.as_ptr()),
+            PCWSTR(dest.as_ptr()),
+            0,
+            None::<&IBindStatusCallback>,
+        )
+    };
+
+    if result.is_ok() && path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn windows_username() -> String {
+    let mut buffer = [0u16; 257];
+    let mut size = buffer.len() as u32;
+    if unsafe { GetUserNameW(Some(PWSTR(buffer.as_mut_ptr())), &mut size) }.is_ok() && size > 1 {
+        String::from_utf16_lossy(&buffer[..size as usize - 1])
+    } else {
+        std::env::var("USERNAME").unwrap_or_else(|_| "Windows User".to_owned())
+    }
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn path_to_wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r, g, b, a }
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> D2D1_COLOR_F {
+    color(
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    )
+}
+
+fn hit(x: f32, y: f32, left: f32, top: f32, width: f32, height: f32) -> bool {
+    x >= left && x <= left + width && y >= top && y <= top + height
+}
