@@ -833,6 +833,25 @@ impl ModeValue {
         &self.modes
     }
 
+    pub fn set_modes(&mut self, modes: impl IntoIterator<Item = impl Into<String>>) {
+        let previous_value = self.value.clone();
+        self.modes = modes.into_iter().map(Into::into).collect();
+        if self.modes.is_empty() {
+            self.value.clear();
+            self.default_value.clear();
+            return;
+        }
+
+        if !self
+            .modes
+            .iter()
+            .any(|candidate| candidate == &self.default_value)
+        {
+            self.default_value = self.modes[0].clone();
+        }
+        self.value = default_mode(&self.modes, &previous_value);
+    }
+
     pub fn set_current_mode(&mut self, mode: impl AsRef<str>) {
         let mode = mode.as_ref();
         if self.modes.iter().any(|candidate| candidate == mode) {
@@ -1002,5 +1021,21 @@ mod tests {
 
         assert!(values[2].is_visible_in(&values));
         assert!(!values[3].is_visible_in(&values));
+    }
+
+    #[test]
+    fn mode_value_replaces_modes_without_losing_valid_selection() {
+        let mut value = ModeValue::new(["A", "B"], "A");
+        value.set_current_mode("B");
+
+        value.set_modes(["B", "C"]);
+
+        assert_eq!(value.current_mode(), "B");
+        assert_eq!(value.default_value(), "B");
+
+        value.set_modes(["C"]);
+
+        assert_eq!(value.current_mode(), "C");
+        assert_eq!(value.default_value(), "C");
     }
 }

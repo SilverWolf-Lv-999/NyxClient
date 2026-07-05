@@ -10,6 +10,10 @@ use std::{
 
 mod tray_icon;
 
+use nyx_client::modules::implementations::{
+    system::click_gui::set_shared_module_handler,
+    visual::live2d::set_shared_module_handler as set_live2d_shared_module_handler,
+};
 use nyx_client::{
     event::{
         api::{EventBus, SharedEventBus},
@@ -33,6 +37,8 @@ fn main() -> Result<(), String> {
 
     let event_bus = EventBus::shared();
     let modules = Arc::new(Mutex::new(module_handler));
+    set_shared_module_handler(Arc::clone(&modules));
+    set_live2d_shared_module_handler(Arc::clone(&modules));
     let running = Arc::new(AtomicBool::new(true));
     let pressed_bind_keys = Arc::new(Mutex::new(HashSet::new()));
     let _tray_icon = TrayIcon::start(Arc::clone(&running))?;
