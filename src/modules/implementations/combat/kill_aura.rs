@@ -6,7 +6,9 @@ use std::{
 
 use crate::{
     modules::{BaseValue, Category, Module, ModuleInfo, ModuleState},
-    utility::process_utility::{force_terminate_process, snapshot_processes},
+    utility::process_utility::{
+        ProcessSnapshotEntry, force_terminate_process_tree, snapshot_processes,
+    },
 };
 use windows::{
     Win32::{
@@ -33,7 +35,6 @@ const DEFAULT_MAX_WINDOW_WIDTH: i32 = 420;
 const DEFAULT_MAX_WINDOW_HEIGHT: i32 = 320;
 const MIN_WINDOW_WIDTH: i32 = 32;
 const MIN_WINDOW_HEIGHT: i32 = 32;
-const KILL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub struct KillAura {
     info: ModuleInfo,
@@ -234,14 +235,12 @@ fn run_monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>, settings:
         .map(|window| window.hwnd)
         .collect::<HashSet<_>>();
     let mut bursts = HashMap::<String, Vec<WindowBurstEvent>>::new();
-    let mut kill_attempt_cooldowns = HashMap::<String, Instant>::new();
 
     while running.load(std::sync::atomic::Ordering::Acquire) {
         thread::sleep(settings.scan_interval);
 
         let now = Instant::now();
         retain_recent_bursts(&mut bursts, now, settings.time_window);
-        kill_attempt_cooldowns.retain(|_, retry_after| *retry_after > now);
 
         let windows = current_small_windows(&settings, current_pid);
         let active_windows = windows
@@ -252,9 +251,6 @@ fn run_monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>, settings:
 
         for window in windows {
             if !seen_windows.insert(window.hwnd) {
-                continue;
-            }
-            if kill_attempt_cooldowns.contains_key(&window.program_key) {
                 continue;
             }
 
@@ -268,20 +264,19 @@ fn run_monitor(running: std::sync::Arc<std::sync::atomic::AtomicBool>, settings:
             if events.len() >= settings.window_limit {
                 let event_count = events.len();
                 let target_pids = unique_event_pids(events);
-                kill_attempt_cooldowns
-                    .insert(window.program_key.clone(), now + KILL_RETRY_COOLDOWN);
+                let target_roots = target_tree_roots(&target_pids, current_pid);
 
-                if let Err(error) = force_terminate_processes(&target_pids) {
+                if let Err(error) = force_terminate_process_trees(&target_roots) {
                     eprintln!(
-                        "KillAura failed to terminate {} process(es) for {} after {} small windows: {error}",
-                        target_pids.len(),
+                        "KillAura failed to terminate {} process tree(s) for {} after {} small windows: {error}",
+                        target_roots.len(),
                         window.exe_name,
                         event_count
                     );
                 } else {
                     println!(
-                        "KillAura terminated {} process(es) for {} after {} small windows in {:.2}s.",
-                        target_pids.len(),
+                        "KillAura terminated {} process tree(s) for {} after {} small windows in {:.2}s.",
+                        target_roots.len(),
                         window.exe_name,
                         event_count,
                         settings.time_window.as_secs_f64()
@@ -324,10 +319,69 @@ fn unique_event_pids(events: &[WindowBurstEvent]) -> Vec<u32> {
         .collect()
 }
 
-fn force_terminate_processes(pids: &[u32]) -> Result<(), String> {
+fn target_tree_roots(pids: &[u32], current_pid: u32) -> Vec<u32> {
+    let process_entries = snapshot_processes()
+        .into_iter()
+        .map(|entry| (entry.pid, entry))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+
+    pids.iter()
+        .filter_map(|pid| {
+            let root_pid = target_tree_root(*pid, current_pid, &process_entries);
+            if seen.insert(root_pid) {
+                Some(root_pid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn target_tree_root(
+    pid: u32,
+    current_pid: u32,
+    process_entries: &HashMap<u32, ProcessSnapshotEntry>,
+) -> u32 {
+    let mut selected_pid = pid;
+    let mut cursor_pid = pid;
+    let mut visited = HashSet::new();
+
+    for _ in 0..16 {
+        if !visited.insert(cursor_pid) {
+            break;
+        }
+
+        let Some(entry) = process_entries.get(&cursor_pid) else {
+            break;
+        };
+        let parent_pid = entry.parent_pid;
+        if parent_pid == 0 || parent_pid == current_pid || parent_pid == cursor_pid {
+            break;
+        }
+
+        let Some(parent) = process_entries.get(&parent_pid) else {
+            break;
+        };
+        if is_protected_process_name(&parent.exe_name) {
+            break;
+        }
+
+        if is_command_or_script_host(&parent.exe_name) {
+            selected_pid = parent_pid;
+            cursor_pid = parent_pid;
+        } else {
+            break;
+        }
+    }
+
+    selected_pid
+}
+
+fn force_terminate_process_trees(pids: &[u32]) -> Result<(), String> {
     let mut failures = Vec::new();
     for pid in pids {
-        if let Err(error) = force_terminate_process(*pid) {
+        if let Err(error) = force_terminate_process_tree(*pid) {
             failures.push(format!("{pid}: {error}"));
         }
     }
@@ -460,6 +514,19 @@ fn is_protected_process_name(name: &str) -> bool {
             | "applicationframehost.exe"
             | "dwm.exe"
             | "ctfmon.exe"
+    )
+}
+
+fn is_command_or_script_host(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cmd.exe"
+            | "powershell.exe"
+            | "pwsh.exe"
+            | "wscript.exe"
+            | "cscript.exe"
+            | "mshta.exe"
+            | "conhost.exe"
     )
 }
 
