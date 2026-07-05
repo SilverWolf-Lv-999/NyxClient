@@ -5,12 +5,13 @@ use std::{
     ptr::null_mut,
     sync::atomic::{AtomicIsize, Ordering},
     thread,
+    time::Instant,
 };
 
 use crate::modules::{Category, Module, ModuleInfo, ModuleState};
 use windows::{
     Win32::{
-        Foundation::{GENERIC_READ, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, GENERIC_READ, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -56,21 +57,24 @@ use windows::{
             WindowsAndMessaging::{
                 CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
                 DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetMessageW,
-                GetSystemMetrics, GetWindowLongPtrW, HTCAPTION, IDC_ARROW, KillTimer, LoadCursorW,
-                MA_NOACTIVATE, MSG, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
-                SW_SHOWNOACTIVATE, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow,
+                GetSystemMetrics, GetWindowLongPtrW, HTCAPTION, IDC_ARROW, KillTimer, LWA_COLORKEY,
+                LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+                SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNOACTIVATE, SendMessageW,
+                SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow,
                 TranslateMessage, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
                 WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
-                WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
     core::{IUnknown, PCWSTR, PWSTR, w},
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 const WINDOW_WIDTH: i32 = 640;
 const WINDOW_HEIGHT: i32 = 440;
+const CLICK_GUI_SCALE: f32 = 1.7;
 const WINDOW_MARGIN: f32 = 14.0;
 const PANEL_MARGIN: f32 = 20.0;
 const HEADER_DRAG_HEIGHT: f32 = 88.0;
@@ -87,6 +91,15 @@ const SWITCH_WIDTH: f32 = 44.0;
 const SWITCH_HEIGHT: f32 = 24.0;
 const ESC_CLOSE_TIMER_ID: usize = 1;
 const ESC_CLOSE_POLL_MS: u32 = 30;
+const ANIMATION_TIMER_ID: usize = 2;
+const ANIMATION_FRAME_MS: u32 = 8;
+const ENTRY_ANIMATION_MS: f32 = 620.0;
+const EXIT_ANIMATION_MS: f32 = 920.0;
+const ENTRY_START_SCALE: f32 = 0.58;
+const EXIT_OVERSHOOT_SCALE: f32 = 1.05;
+const EXIT_END_SCALE: f32 = 0.06;
+const EXIT_OVERSHOOT_PORTION: f32 = 0.45;
+const TRANSPARENT_KEY: COLORREF = COLORREF(0x0003_0201);
 const KEY_STATE_DOWN_MASK: i16 = 0x8000_u16 as i16;
 const STARTING_HWND: isize = -1;
 const ICON_URL: &str = "https://raw.githubusercontent.com/github/explore/main/topics/rust/rust.png";
@@ -150,6 +163,10 @@ impl Module for ClickGui {
 fn toggle_gui_window() {
     let hwnd_value = OPEN_HWND.load(Ordering::Acquire);
     if hwnd_value > 0 {
+        let hwnd = HWND(hwnd_value as *mut c_void);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
         return;
     }
 
@@ -199,17 +216,18 @@ fn run_gui_window() -> windows::core::Result<()> {
         RegisterClassW(&window_class);
     }
 
-    let (window_x, window_y) = centered_window_position();
+    let (window_width, window_height) = animation_canvas_size();
+    let (window_x, window_y) = centered_window_position(window_width, window_height);
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             class_name,
             w!("NyxClient ClickGui"),
             WS_POPUP,
             window_x,
             window_y,
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
+            window_width,
+            window_height,
             None,
             None,
             Some(hinstance),
@@ -220,6 +238,7 @@ fn run_gui_window() -> windows::core::Result<()> {
     let _leaked_to_window = Box::into_raw(app);
 
     unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, TRANSPARENT_KEY, 255, LWA_COLORKEY);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
@@ -234,13 +253,20 @@ fn run_gui_window() -> windows::core::Result<()> {
     Ok(())
 }
 
-fn centered_window_position() -> (i32, i32) {
+fn centered_window_position(width: i32, height: i32) -> (i32, i32) {
     let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let x = ((screen_width - WINDOW_WIDTH) / 2).max(0);
-    let y = ((screen_height - WINDOW_HEIGHT) / 2).max(0);
+    let x = ((screen_width - width) / 2).max(0);
+    let y = ((screen_height - height) / 2).max(0);
 
     (x, y)
+}
+
+fn animation_canvas_size() -> (i32, i32) {
+    (
+        (WINDOW_WIDTH as f32 * CLICK_GUI_SCALE * EXIT_OVERSHOOT_SCALE).ceil() as i32,
+        (WINDOW_HEIGHT as f32 * CLICK_GUI_SCALE * EXIT_OVERSHOOT_SCALE).ceil() as i32,
+    )
 }
 
 struct ComScope;
@@ -265,6 +291,7 @@ struct GuiApp {
     is_admin: bool,
     selected_category: Category,
     close_key_was_down: bool,
+    animation: GuiAnimation,
     cards: Vec<GuiCard>,
 }
 
@@ -296,6 +323,7 @@ impl GuiApp {
             is_admin: unsafe { IsUserAnAdmin().0 != 0 },
             selected_category: Category::System,
             close_key_was_down: is_escape_key_down(),
+            animation: GuiAnimation::entering(),
             cards: seed_cards(),
         })
     }
@@ -312,12 +340,18 @@ impl GuiApp {
         unsafe {
             target.BeginDraw();
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            target.Clear(Some(&color(0.07, 0.08, 0.10, 1.0)));
+            target.Clear(Some(&transparent_key_color()));
         }
 
-        self.draw_shell(&target);
+        let transform = self.render_transform();
+        unsafe {
+            target.SetTransform(&transform);
+        }
+        self.draw_shell(&target, WINDOW_WIDTH as f32, WINDOW_HEIGHT as f32);
 
         unsafe {
+            let identity = Matrix3x2::identity();
+            target.SetTransform(&identity);
             let _ = target.EndDraw(None, None);
         }
     }
@@ -401,7 +435,7 @@ impl GuiApp {
     }
 
     fn handle_click(&mut self, x: f32, y: f32) {
-        let width = self.client_size().width as f32;
+        let width = WINDOW_WIDTH as f32;
         let switch_left = width - 86.0;
 
         for (index, category) in Category::ALL.iter().copied().enumerate() {
@@ -443,6 +477,96 @@ impl GuiApp {
         should_close
     }
 
+    fn start_entry_animation(&mut self) {
+        self.animation.start_entry();
+        unsafe {
+            let _ = SetTimer(
+                Some(self.hwnd),
+                ANIMATION_TIMER_ID,
+                ANIMATION_FRAME_MS,
+                None,
+            );
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn request_close(&mut self) {
+        if self.animation.is_exiting() {
+            return;
+        }
+
+        self.animation.start_exit();
+        unsafe {
+            let _ = SetTimer(
+                Some(self.hwnd),
+                ANIMATION_TIMER_ID,
+                ANIMATION_FRAME_MS,
+                None,
+            );
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn tick_animation(&mut self) -> bool {
+        if !self.animation.is_active() {
+            return false;
+        }
+
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+
+        if !self.animation.is_finished() {
+            return false;
+        }
+
+        match self.animation.phase() {
+            GuiAnimationPhase::Entering => {
+                self.animation.finish_entry();
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), ANIMATION_TIMER_ID);
+                    let _ = InvalidateRect(Some(self.hwnd), None, false);
+                }
+                false
+            }
+            GuiAnimationPhase::Exiting => true,
+            GuiAnimationPhase::Idle => false,
+        }
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.animation.is_exiting()
+    }
+
+    fn render_transform(&self) -> Matrix3x2 {
+        let (scale_x, scale_y, offset_x, offset_y) = self.render_scale_and_offset();
+        Matrix3x2 {
+            M11: scale_x,
+            M12: 0.0,
+            M21: 0.0,
+            M22: scale_y,
+            M31: offset_x,
+            M32: offset_y,
+        }
+    }
+
+    fn to_logical_point(&self, x: f32, y: f32) -> (f32, f32) {
+        let (scale_x, scale_y, offset_x, offset_y) = self.render_scale_and_offset();
+
+        ((x - offset_x) / scale_x, (y - offset_y) / scale_y)
+    }
+
+    fn render_scale_and_offset(&self) -> (f32, f32, f32, f32) {
+        let size = self.client_size();
+        let animation_scale = self.animation.scale();
+        let scale_x = animation_scale * CLICK_GUI_SCALE;
+        let scale_y = animation_scale * CLICK_GUI_SCALE;
+        let offset_x = (size.width as f32 - WINDOW_WIDTH as f32 * scale_x) * 0.5;
+        let offset_y = (size.height as f32 - WINDOW_HEIGHT as f32 * scale_y) * 0.5;
+
+        (scale_x.max(0.0001), scale_y.max(0.0001), offset_x, offset_y)
+    }
+
     fn client_size(&self) -> D2D_SIZE_U {
         let mut rect = RECT::default();
         if unsafe { GetClientRect(self.hwnd, &mut rect) }.is_ok() {
@@ -451,18 +575,15 @@ impl GuiApp {
                 height: (rect.bottom - rect.top).max(1) as u32,
             }
         } else {
+            let (width, height) = animation_canvas_size();
             D2D_SIZE_U {
-                width: WINDOW_WIDTH as u32,
-                height: WINDOW_HEIGHT as u32,
+                width: width as u32,
+                height: height as u32,
             }
         }
     }
 
-    fn draw_shell(&self, target: &ID2D1HwndRenderTarget) {
-        let size = self.client_size();
-        let width = size.width as f32;
-        let height = size.height as f32;
-
+    fn draw_shell(&self, target: &ID2D1HwndRenderTarget, width: f32, height: f32) {
         self.fill_round(
             target,
             rect(
@@ -957,6 +1078,94 @@ impl GuiApp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiAnimationPhase {
+    Entering,
+    Idle,
+    Exiting,
+}
+
+#[derive(Debug)]
+struct GuiAnimation {
+    phase: GuiAnimationPhase,
+    started_at: Instant,
+}
+
+impl GuiAnimation {
+    fn entering() -> Self {
+        Self {
+            phase: GuiAnimationPhase::Entering,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn start_entry(&mut self) {
+        self.phase = GuiAnimationPhase::Entering;
+        self.started_at = Instant::now();
+    }
+
+    fn start_exit(&mut self) {
+        self.phase = GuiAnimationPhase::Exiting;
+        self.started_at = Instant::now();
+    }
+
+    fn finish_entry(&mut self) {
+        self.phase = GuiAnimationPhase::Idle;
+    }
+
+    fn phase(&self) -> GuiAnimationPhase {
+        self.phase
+    }
+
+    fn is_active(&self) -> bool {
+        self.phase != GuiAnimationPhase::Idle
+    }
+
+    fn is_exiting(&self) -> bool {
+        self.phase == GuiAnimationPhase::Exiting
+    }
+
+    fn is_finished(&self) -> bool {
+        match self.phase {
+            GuiAnimationPhase::Entering => self.progress(ENTRY_ANIMATION_MS) >= 1.0,
+            GuiAnimationPhase::Exiting => self.progress(EXIT_ANIMATION_MS) >= 1.0,
+            GuiAnimationPhase::Idle => false,
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        match self.phase {
+            GuiAnimationPhase::Entering => {
+                let progress = ease_out_quad(self.progress(ENTRY_ANIMATION_MS));
+                lerp(ENTRY_START_SCALE, 1.0, progress)
+            }
+            GuiAnimationPhase::Exiting => {
+                let progress = self.progress(EXIT_ANIMATION_MS);
+                if progress < EXIT_OVERSHOOT_PORTION {
+                    lerp(
+                        1.0,
+                        EXIT_OVERSHOOT_SCALE,
+                        ease_out_quad(progress / EXIT_OVERSHOOT_PORTION),
+                    )
+                } else {
+                    let shrink_progress =
+                        (progress - EXIT_OVERSHOOT_PORTION) / (1.0 - EXIT_OVERSHOOT_PORTION);
+                    lerp(
+                        EXIT_OVERSHOOT_SCALE,
+                        EXIT_END_SCALE,
+                        ease_in_out_cubic(shrink_progress),
+                    )
+                }
+            }
+            GuiAnimationPhase::Idle => 1.0,
+        }
+    }
+
+    fn progress(&self, duration_ms: f32) -> f32 {
+        (self.started_at.elapsed().as_secs_f32() * 1000.0 / duration_ms).clamp(0.0, 1.0)
+    }
+}
+
 struct GuiCard {
     category: Category,
     name: &'static str,
@@ -979,6 +1188,7 @@ unsafe extern "system" fn window_proc(
                     unsafe {
                         (*app_ptr).hwnd = hwnd;
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
+                        (*app_ptr).start_entry_animation();
                     }
                     OPEN_HWND.store(hwnd.0 as isize, Ordering::Release);
                     unsafe {
@@ -1014,9 +1224,14 @@ unsafe extern "system" fn window_proc(
         }
         WM_LBUTTONDOWN => {
             if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
-                let x = (lparam.0 as u32 & 0xffff) as i16 as f32;
-                let y = ((lparam.0 as u32 >> 16) & 0xffff) as i16 as f32;
-                let width = app.client_size().width as f32;
+                if app.is_exiting() {
+                    return LRESULT(0);
+                }
+
+                let raw_x = (lparam.0 as u32 & 0xffff) as i16 as f32;
+                let raw_y = ((lparam.0 as u32 >> 16) & 0xffff) as i16 as f32;
+                let (x, y) = app.to_logical_point(raw_x, raw_y);
+                let width = WINDOW_WIDTH as f32;
                 if y <= HEADER_DRAG_HEIGHT && x >= WINDOW_MARGIN && x <= width - WINDOW_MARGIN {
                     unsafe {
                         let _ = ReleaseCapture();
@@ -1040,6 +1255,14 @@ unsafe extern "system" fn window_proc(
             if wparam.0 == ESC_CLOSE_TIMER_ID {
                 if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
                     if app.should_close_for_escape() {
+                        app.request_close();
+                    }
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == ANIMATION_TIMER_ID {
+                if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                    if app.tick_animation() {
                         unsafe {
                             let _ = DestroyWindow(hwnd);
                         }
@@ -1049,7 +1272,12 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
-        WM_CLOSE => LRESULT(0),
+        WM_CLOSE => {
+            if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                app.request_close();
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe {
                 PostQuitMessage(0);
@@ -1060,6 +1288,7 @@ unsafe extern "system" fn window_proc(
             let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GuiApp };
             unsafe {
                 let _ = KillTimer(Some(hwnd), ESC_CLOSE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
             }
             if !raw.is_null() {
                 unsafe {
@@ -1183,6 +1412,28 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> D2D1_COLOR_F {
         b as f32 / 255.0,
         a as f32 / 255.0,
     )
+}
+
+fn transparent_key_color() -> D2D1_COLOR_F {
+    rgba(1, 2, 3, 255)
+}
+
+fn lerp(start: f32, end: f32, progress: f32) -> f32 {
+    start + (end - start) * progress.clamp(0.0, 1.0)
+}
+
+fn ease_out_quad(progress: f32) -> f32 {
+    let inverse = 1.0 - progress.clamp(0.0, 1.0);
+    1.0 - inverse * inverse
+}
+
+fn ease_in_out_cubic(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress < 0.5 {
+        4.0 * progress * progress * progress
+    } else {
+        1.0 - (-2.0 * progress + 2.0).powi(3) / 2.0
+    }
 }
 
 fn hit(x: f32, y: f32, left: f32, top: f32, width: f32, height: f32) -> bool {
