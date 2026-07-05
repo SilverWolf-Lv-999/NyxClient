@@ -1,5 +1,7 @@
 use std::{
     collections::HashSet,
+    ffi::OsStr,
+    os::windows::ffi::OsStrExt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,6 +13,7 @@ use std::{
 mod tray_icon;
 
 use nyx_client::modules::implementations::{
+    player::fast_close::set_shared_module_handler as set_fast_close_shared_module_handler,
     system::click_gui::set_shared_module_handler,
     visual::live2d::set_shared_module_handler as set_live2d_shared_module_handler,
 };
@@ -25,11 +28,111 @@ use nyx_client::{
     modules::{Category, ModuleHandler, ToggleResult},
 };
 use tray_icon::TrayIcon;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RSHIFT};
+use windows::{
+    Win32::UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RSHIFT},
+        Shell::{IsUserAnAdmin, ShellExecuteW},
+        WindowsAndMessaging::SW_SHOWNORMAL,
+    },
+    core::{PCWSTR, w},
+};
 
 const KEY_STATE_DOWN_MASK: i16 = 0x8000_u16 as i16;
 
+fn ensure_elevated() -> Result<bool, String> {
+    if unsafe { IsUserAnAdmin().0 != 0 } {
+        return Ok(true);
+    }
+
+    let exe_path =
+        std::env::current_exe().map_err(|error| format!("failed to get current exe: {error}"))?;
+    let exe_path = wide_null(exe_path.as_os_str());
+    let parameters = current_process_parameters();
+    let parameters = if parameters.is_empty() {
+        Vec::new()
+    } else {
+        parameters.encode_utf16().chain([0]).collect()
+    };
+    let parameter_ptr = if parameters.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(parameters.as_ptr())
+    };
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            PCWSTR(exe_path.as_ptr()),
+            parameter_ptr,
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let result_code = result.0 as isize;
+    if result_code <= 32 {
+        Err(format!(
+            "failed to restart NyxClient as administrator: ShellExecuteW returned {result_code}"
+        ))
+    } else {
+        Ok(false)
+    }
+}
+
+fn current_process_parameters() -> String {
+    std::env::args_os()
+        .skip(1)
+        .map(|argument| quote_windows_argument(&argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_windows_argument(argument: &OsStr) -> String {
+    let argument = argument.to_string_lossy();
+    if argument.is_empty() {
+        return "\"\"".to_owned();
+    }
+    if !argument.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return argument.into_owned();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for ch in argument.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain([0]).collect()
+}
+
 fn main() -> Result<(), String> {
+    if !ensure_elevated()? {
+        return Ok(());
+    }
+
     let mut module_handler = ModuleHandler::with_builtin_modules();
     configure_default_key_binds(&mut module_handler);
     load_default_config(&mut module_handler);
@@ -39,6 +142,8 @@ fn main() -> Result<(), String> {
     let modules = Arc::new(Mutex::new(module_handler));
     set_shared_module_handler(Arc::clone(&modules));
     set_live2d_shared_module_handler(Arc::clone(&modules));
+    set_fast_close_shared_module_handler(Arc::clone(&modules));
+    enable_fast_close_hook(&modules);
     let running = Arc::new(AtomicBool::new(true));
     let pressed_bind_keys = Arc::new(Mutex::new(HashSet::new()));
     let _tray_icon = TrayIcon::start(Arc::clone(&running))?;
@@ -71,6 +176,13 @@ fn configure_default_key_binds(module_handler: &mut ModuleHandler) {
                 .set_key_bind(Some(u32::from(VK_RSHIFT.0)));
         }
     }
+}
+
+fn enable_fast_close_hook(modules: &Arc<Mutex<ModuleHandler>>) {
+    let Ok(mut modules) = modules.lock() else {
+        return;
+    };
+    let _ = modules.set_enabled("FastClose", true);
 }
 
 fn load_default_config(module_handler: &mut ModuleHandler) {
