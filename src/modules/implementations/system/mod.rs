@@ -1,4 +1,3 @@
-#[path = "ClickGui.rs"]
 pub mod click_gui;
 
 use crate::modules::ModuleHandler;

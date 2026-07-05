@@ -1,25 +1,10 @@
-#[path = "EventCommandLine.rs"]
 pub mod event_command_line;
-
-#[path = "EventKeyboard.rs"]
 pub mod event_keyboard;
-
-#[path = "EventLifecycle.rs"]
 pub mod event_lifecycle;
-
-#[path = "EventMouse.rs"]
 pub mod event_mouse;
-
-#[path = "EventTick.rs"]
 pub mod event_tick;
-
-#[path = "EventWindows.rs"]
 pub mod event_windows;
-
-#[path = "WindowsHookPublisher.rs"]
 pub mod windows_hook_publisher;
-
-#[path = "WindowsSessionPublisher.rs"]
 pub mod windows_session_publisher;
 
 pub use event_command_line::{CommandLineAction, CommandLineStream, EventCommandLine};

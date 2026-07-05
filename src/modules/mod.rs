@@ -1,8 +1,5 @@
-#[path = "Module.rs"]
-pub mod module;
-
-#[path = "impl/mod.rs"]
 pub mod implementations;
+pub mod module;
 
 pub use implementations::register_builtin_modules;
 pub use module::{

@@ -1,4 +1,3 @@
-#[path = "Fun.rs"]
 pub mod fun;
 
 use crate::modules::ModuleHandler;
