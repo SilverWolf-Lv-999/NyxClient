@@ -5,7 +5,7 @@ use std::{
 
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
-    System::Threading::GetCurrentThreadId,
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
@@ -39,6 +39,7 @@ static HOOK_CONTEXT: OnceLock<Mutex<Option<SharedEventBus>>> = OnceLock::new();
 #[derive(Debug)]
 pub enum WindowsHookError {
     AlreadyRunning,
+    ModuleHandle(windows::core::Error),
     KeyboardHook(windows::core::Error),
     MouseHook(windows::core::Error),
     StartupFailed,
@@ -119,11 +120,20 @@ struct InstalledHooks {
 
 impl InstalledHooks {
     fn install() -> Result<Self, WindowsHookError> {
-        let keyboard =
-            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) }
-                .map_err(WindowsHookError::KeyboardHook)?;
-        let mouse = match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
-        {
+        let hmodule = unsafe { GetModuleHandleW(None) }.map_err(WindowsHookError::ModuleHandle)?;
+
+        let keyboard = unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook_proc),
+                Some(hmodule.into()),
+                0,
+            )
+        }
+        .map_err(WindowsHookError::KeyboardHook)?;
+        let mouse = match unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(hmodule.into()), 0)
+        } {
             Ok(mouse) => mouse,
             Err(error) => {
                 unsafe {

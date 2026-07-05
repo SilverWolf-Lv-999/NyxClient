@@ -51,15 +51,17 @@ use windows::{
             WindowsProgramming::GetUserNameW,
         },
         UI::{
+            Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_ESCAPE},
             Shell::IsUserAnAdmin,
             WindowsAndMessaging::{
-                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-                DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
-                GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostMessageW,
-                PostQuitMessage, RegisterClassW, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
-                ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND,
-                WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WNDCLASSW,
-                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
+                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetMessageW,
+                GetSystemMetrics, GetWindowLongPtrW, HTCAPTION, IDC_ARROW, KillTimer, LoadCursorW,
+                MA_NOACTIVATE, MSG, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
+                SW_SHOWNOACTIVATE, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow,
+                TranslateMessage, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
+                WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
+                WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -69,6 +71,23 @@ use windows_numerics::Vector2;
 
 const WINDOW_WIDTH: i32 = 640;
 const WINDOW_HEIGHT: i32 = 440;
+const WINDOW_MARGIN: f32 = 14.0;
+const PANEL_MARGIN: f32 = 20.0;
+const HEADER_DRAG_HEIGHT: f32 = 88.0;
+const SIDEBAR_LEFT: f32 = 28.0;
+const SIDEBAR_RIGHT: f32 = 176.0;
+const CATEGORY_TOP: f32 = 112.0;
+const CATEGORY_HEIGHT: f32 = 34.0;
+const CATEGORY_STEP: f32 = 42.0;
+const CONTENT_LEFT: f32 = 204.0;
+const CARD_TOP: f32 = 136.0;
+const CARD_HEIGHT: f32 = 62.0;
+const CARD_STEP: f32 = 76.0;
+const SWITCH_WIDTH: f32 = 44.0;
+const SWITCH_HEIGHT: f32 = 24.0;
+const ESC_CLOSE_TIMER_ID: usize = 1;
+const ESC_CLOSE_POLL_MS: u32 = 30;
+const KEY_STATE_DOWN_MASK: i16 = 0x8000_u16 as i16;
 const STARTING_HWND: isize = -1;
 const ICON_URL: &str = "https://raw.githubusercontent.com/github/explore/main/topics/rust/rust.png";
 
@@ -131,11 +150,6 @@ impl Module for ClickGui {
 fn toggle_gui_window() {
     let hwnd_value = OPEN_HWND.load(Ordering::Acquire);
     if hwnd_value > 0 {
-        let hwnd = HWND(hwnd_value as *mut c_void);
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-            let _ = SetForegroundWindow(hwnd);
-        }
         return;
     }
 
@@ -185,14 +199,15 @@ fn run_gui_window() -> windows::core::Result<()> {
         RegisterClassW(&window_class);
     }
 
+    let (window_x, window_y) = centered_window_position();
     let hwnd = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!("NyxClient ClickGui"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            WS_POPUP,
+            window_x,
+            window_y,
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
             None,
@@ -205,7 +220,7 @@ fn run_gui_window() -> windows::core::Result<()> {
     let _leaked_to_window = Box::into_raw(app);
 
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 
     let mut message = MSG::default();
@@ -217,6 +232,15 @@ fn run_gui_window() -> windows::core::Result<()> {
     }
 
     Ok(())
+}
+
+fn centered_window_position() -> (i32, i32) {
+    let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let x = ((screen_width - WINDOW_WIDTH) / 2).max(0);
+    let y = ((screen_height - WINDOW_HEIGHT) / 2).max(0);
+
+    (x, y)
 }
 
 struct ComScope;
@@ -240,6 +264,7 @@ struct GuiApp {
     username: String,
     is_admin: bool,
     selected_category: Category,
+    close_key_was_down: bool,
     cards: Vec<GuiCard>,
 }
 
@@ -270,6 +295,7 @@ impl GuiApp {
             username: windows_username(),
             is_admin: unsafe { IsUserAnAdmin().0 != 0 },
             selected_category: Category::System,
+            close_key_was_down: is_escape_key_down(),
             cards: seed_cards(),
         })
     }
@@ -375,9 +401,19 @@ impl GuiApp {
     }
 
     fn handle_click(&mut self, x: f32, y: f32) {
+        let width = self.client_size().width as f32;
+        let switch_left = width - 86.0;
+
         for (index, category) in Category::ALL.iter().copied().enumerate() {
-            let top = 104.0 + index as f32 * 42.0;
-            if hit(x, y, 18.0, top, 130.0, 34.0) {
+            let top = CATEGORY_TOP + index as f32 * CATEGORY_STEP;
+            if hit(
+                x,
+                y,
+                SIDEBAR_LEFT,
+                top,
+                SIDEBAR_RIGHT - SIDEBAR_LEFT,
+                CATEGORY_HEIGHT,
+            ) {
                 self.selected_category = category;
                 return;
             }
@@ -389,13 +425,22 @@ impl GuiApp {
             .iter_mut()
             .filter(|card| card.category == self.selected_category)
         {
-            let top = 90.0 + row as f32 * 76.0;
-            if hit(x, y, 552.0, top + 23.0, 44.0, 24.0) {
+            let top = CARD_TOP + row as f32 * CARD_STEP;
+            let switch_top = top + (CARD_HEIGHT - SWITCH_HEIGHT) / 2.0;
+            if hit(x, y, switch_left, switch_top, SWITCH_WIDTH, SWITCH_HEIGHT) {
                 card.enabled = !card.enabled;
                 return;
             }
             row += 1;
         }
+    }
+
+    fn should_close_for_escape(&mut self) -> bool {
+        let is_down = is_escape_key_down();
+        let should_close = is_down && !self.close_key_was_down;
+        self.close_key_was_down = is_down;
+
+        should_close
     }
 
     fn client_size(&self) -> D2D_SIZE_U {
@@ -420,30 +465,45 @@ impl GuiApp {
 
         self.fill_round(
             target,
-            rect(14.0, 14.0, width - 14.0, height - 14.0),
+            rect(
+                WINDOW_MARGIN,
+                WINDOW_MARGIN,
+                width - WINDOW_MARGIN,
+                height - WINDOW_MARGIN,
+            ),
             16.0,
             rgba(16, 18, 23, 255),
         );
-        self.fill_round(
+        self.stroke_round(
             target,
-            rect(20.0, 20.0, 166.0, height - 20.0),
-            13.0,
-            rgba(22, 25, 31, 255),
+            rect(
+                WINDOW_MARGIN,
+                WINDOW_MARGIN,
+                width - WINDOW_MARGIN,
+                height - WINDOW_MARGIN,
+            ),
+            16.0,
+            rgba(48, 55, 68, 255),
+            1.0,
         );
         self.fill_round(
             target,
-            rect(176.0, 20.0, width - 20.0, height - 20.0),
+            rect(
+                PANEL_MARGIN,
+                PANEL_MARGIN,
+                width - PANEL_MARGIN,
+                height - PANEL_MARGIN,
+            ),
             13.0,
             rgba(19, 22, 29, 255),
         );
 
-        self.draw_brand(target);
-        self.draw_categories(target);
-        self.draw_profile(target, height);
+        self.draw_header(target, width);
+        self.draw_categories(target, height);
         self.draw_content(target, width);
     }
 
-    fn draw_brand(&self, target: &ID2D1HwndRenderTarget) {
+    fn draw_header(&self, target: &ID2D1HwndRenderTarget, width: f32) {
         self.fill_round(
             target,
             rect(34.0, 34.0, 70.0, 70.0),
@@ -482,10 +542,10 @@ impl GuiApp {
         }
         self.text(
             target,
-            "Nyx",
+            "NyxClient",
             82.0,
             35.0,
-            150.0,
+            210.0,
             55.0,
             18.0,
             DWRITE_FONT_WEIGHT_BOLD,
@@ -494,65 +554,43 @@ impl GuiApp {
         );
         self.text(
             target,
-            "Client",
+            "ClickGui",
             82.0,
             56.0,
-            150.0,
+            210.0,
             72.0,
             11.0,
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_TEXT_ALIGNMENT_LEADING,
             rgba(133, 146, 166, 255),
         );
-    }
 
-    fn draw_categories(&self, target: &ID2D1HwndRenderTarget) {
-        for (index, category) in Category::ALL.iter().copied().enumerate() {
-            let top = 104.0 + index as f32 * 42.0;
-            let selected = category == self.selected_category;
-            let bg = if selected {
-                rgba(54, 95, 132, 255)
-            } else {
-                rgba(27, 31, 39, 255)
-            };
-            let fg = if selected {
-                rgba(248, 251, 255, 255)
-            } else {
-                rgba(153, 166, 186, 255)
-            };
-            self.fill_round(target, rect(18.0, top, 148.0, top + 34.0), 8.0, bg);
-            self.text(
-                target,
-                category.display_name(),
-                44.0,
-                top + 7.0,
-                138.0,
-                top + 28.0,
-                13.0,
-                DWRITE_FONT_WEIGHT_DEMI_BOLD,
-                DWRITE_TEXT_ALIGNMENT_LEADING,
-                fg,
-            );
-            self.fill_round(target, rect(28.0, top + 12.0, 36.0, top + 20.0), 4.0, fg);
-        }
-    }
-
-    fn draw_profile(&self, target: &ID2D1HwndRenderTarget, height: f32) {
-        let top = height - 82.0;
+        self.draw_profile_badge(target, width);
         self.fill_round(
             target,
-            rect(30.0, top, 156.0, top + 50.0),
+            rect(36.0, 88.0, width - 36.0, 89.0),
+            0.5,
+            rgba(42, 49, 61, 255),
+        );
+    }
+
+    fn draw_profile_badge(&self, target: &ID2D1HwndRenderTarget, width: f32) {
+        let left = (width - 220.0).max(234.0);
+        let right = width - 34.0;
+        self.fill_round(
+            target,
+            rect(left, 34.0, right, 70.0),
             12.0,
             rgba(28, 33, 42, 255),
         );
 
         let avatar = D2D1_ELLIPSE {
             point: Vector2 {
-                X: 54.0,
-                Y: top + 25.0,
+                X: left + 24.0,
+                Y: 52.0,
             },
-            radiusX: 16.0,
-            radiusY: 16.0,
+            radiusX: 14.0,
+            radiusY: 14.0,
         };
         if let Ok(brush) = self.brush(target, rgba(65, 122, 159, 255)) {
             unsafe {
@@ -569,11 +607,11 @@ impl GuiApp {
         self.text(
             target,
             &initial,
+            left + 10.0,
             38.0,
-            top + 8.0,
-            70.0,
-            top + 38.0,
-            15.0,
+            left + 38.0,
+            64.0,
+            14.0,
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_TEXT_ALIGNMENT_CENTER,
             rgba(255, 255, 255, 255),
@@ -581,47 +619,96 @@ impl GuiApp {
         self.text(
             target,
             &self.username,
-            78.0,
-            top + 8.0,
-            146.0,
-            top + 26.0,
+            left + 48.0,
+            37.0,
+            right - 48.0,
+            57.0,
             12.0,
             DWRITE_FONT_WEIGHT_DEMI_BOLD,
             DWRITE_TEXT_ALIGNMENT_LEADING,
             rgba(236, 241, 247, 255),
         );
 
-        if self.is_admin {
+        let label = if self.is_admin { "Dev" } else { "User" };
+        let label_bg = if self.is_admin {
+            rgba(194, 80, 69, 255)
+        } else {
+            rgba(54, 95, 132, 255)
+        };
+        self.fill_round(
+            target,
+            rect(right - 42.0, 45.0, right - 12.0, 61.0),
+            7.0,
+            label_bg,
+        );
+        self.text(
+            target,
+            label,
+            right - 42.0,
+            45.0,
+            right - 12.0,
+            59.0,
+            9.0,
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+            rgba(255, 255, 255, 255),
+        );
+    }
+
+    fn draw_categories(&self, target: &ID2D1HwndRenderTarget, height: f32) {
+        self.fill_round(
+            target,
+            rect(22.0, 100.0, SIDEBAR_RIGHT, height - 22.0),
+            12.0,
+            rgba(22, 25, 31, 255),
+        );
+
+        for (index, category) in Category::ALL.iter().copied().enumerate() {
+            let top = CATEGORY_TOP + index as f32 * CATEGORY_STEP;
+            let selected = category == self.selected_category;
+            let bg = if selected {
+                rgba(54, 95, 132, 255)
+            } else {
+                rgba(27, 31, 39, 255)
+            };
+            let fg = if selected {
+                rgba(248, 251, 255, 255)
+            } else {
+                rgba(153, 166, 186, 255)
+            };
             self.fill_round(
                 target,
-                rect(78.0, top + 28.0, 112.0, top + 44.0),
-                7.0,
-                rgba(194, 80, 69, 255),
+                rect(
+                    SIDEBAR_LEFT,
+                    top,
+                    SIDEBAR_RIGHT - 12.0,
+                    top + CATEGORY_HEIGHT,
+                ),
+                8.0,
+                bg,
+            );
+            self.fill_round(
+                target,
+                rect(
+                    SIDEBAR_LEFT + 10.0,
+                    top + 12.0,
+                    SIDEBAR_LEFT + 18.0,
+                    top + 20.0,
+                ),
+                4.0,
+                fg,
             );
             self.text(
                 target,
-                "Dev",
-                78.0,
+                category.display_name(),
+                SIDEBAR_LEFT + 26.0,
+                top + 7.0,
+                SIDEBAR_RIGHT - 22.0,
                 top + 28.0,
-                112.0,
-                top + 42.0,
-                9.0,
-                DWRITE_FONT_WEIGHT_BOLD,
-                DWRITE_TEXT_ALIGNMENT_CENTER,
-                rgba(255, 255, 255, 255),
-            );
-        } else {
-            self.text(
-                target,
-                "User",
-                78.0,
-                top + 28.0,
-                120.0,
-                top + 44.0,
-                10.0,
-                DWRITE_FONT_WEIGHT_NORMAL,
+                13.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
-                rgba(122, 137, 157, 255),
+                fg,
             );
         }
     }
@@ -630,44 +717,36 @@ impl GuiApp {
         self.text(
             target,
             self.selected_category.display_name(),
-            204.0,
-            42.0,
+            CONTENT_LEFT,
+            102.0,
             width - 38.0,
-            70.0,
-            22.0,
+            126.0,
+            18.0,
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_TEXT_ALIGNMENT_LEADING,
             rgba(245, 248, 252, 255),
         );
-        self.text(
-            target,
-            "Direct2D module surface",
-            204.0,
-            68.0,
-            width - 38.0,
-            88.0,
-            12.0,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_LEADING,
-            rgba(137, 151, 171, 255),
-        );
 
+        let mut visible_cards = 0;
         for (row, card) in self
             .cards
             .iter()
             .filter(|card| card.category == self.selected_category)
             .enumerate()
         {
-            let top = 94.0 + row as f32 * 76.0;
+            visible_cards += 1;
+            let top = CARD_TOP + row as f32 * CARD_STEP;
+            let switch_left = width - 86.0;
+            let switch_top = top + (CARD_HEIGHT - SWITCH_HEIGHT) / 2.0;
             self.fill_round(
                 target,
-                rect(204.0, top, width - 38.0, top + 62.0),
+                rect(CONTENT_LEFT, top, width - 38.0, top + CARD_HEIGHT),
                 10.0,
                 rgba(28, 33, 42, 255),
             );
             self.stroke_round(
                 target,
-                rect(204.0, top, width - 38.0, top + 62.0),
+                rect(CONTENT_LEFT, top, width - 38.0, top + CARD_HEIGHT),
                 10.0,
                 rgba(42, 49, 61, 255),
                 1.0,
@@ -675,9 +754,9 @@ impl GuiApp {
             self.text(
                 target,
                 card.name,
-                222.0,
+                CONTENT_LEFT + 18.0,
                 top + 10.0,
-                width - 98.0,
+                switch_left - 18.0,
                 top + 30.0,
                 14.0,
                 DWRITE_FONT_WEIGHT_DEMI_BOLD,
@@ -687,16 +766,56 @@ impl GuiApp {
             self.text(
                 target,
                 card.description,
-                222.0,
+                CONTENT_LEFT + 18.0,
                 top + 33.0,
-                width - 98.0,
+                switch_left - 18.0,
                 top + 52.0,
                 11.0,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 rgba(133, 148, 168, 255),
             );
-            self.draw_switch(target, width - 86.0, top + 20.0, card.enabled);
+            self.text(
+                target,
+                card.category.display_name(),
+                width - 170.0,
+                top + 10.0,
+                switch_left - 18.0,
+                top + 29.0,
+                10.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                rgba(122, 137, 157, 255),
+            );
+            self.draw_switch(target, switch_left, switch_top, card.enabled);
+        }
+
+        if visible_cards == 0 {
+            self.fill_round(
+                target,
+                rect(CONTENT_LEFT, CARD_TOP, width - 38.0, CARD_TOP + CARD_HEIGHT),
+                10.0,
+                rgba(28, 33, 42, 255),
+            );
+            self.stroke_round(
+                target,
+                rect(CONTENT_LEFT, CARD_TOP, width - 38.0, CARD_TOP + CARD_HEIGHT),
+                10.0,
+                rgba(42, 49, 61, 255),
+                1.0,
+            );
+            self.text(
+                target,
+                "No modules",
+                CONTENT_LEFT + 18.0,
+                CARD_TOP + 17.0,
+                width - 56.0,
+                CARD_TOP + 43.0,
+                14.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                rgba(133, 148, 168, 255),
+            );
         }
     }
 
@@ -706,12 +825,17 @@ impl GuiApp {
         } else {
             rgba(58, 65, 77, 255)
         };
-        self.fill_round(target, rect(left, top, left + 44.0, top + 24.0), 12.0, bg);
+        self.fill_round(
+            target,
+            rect(left, top, left + SWITCH_WIDTH, top + SWITCH_HEIGHT),
+            SWITCH_HEIGHT / 2.0,
+            bg,
+        );
         let knob_x = if enabled { left + 31.0 } else { left + 13.0 };
         let ellipse = D2D1_ELLIPSE {
             point: Vector2 {
                 X: knob_x,
-                Y: top + 12.0,
+                Y: top + SWITCH_HEIGHT / 2.0,
             },
             radiusX: 8.0,
             radiusY: 8.0,
@@ -857,11 +981,15 @@ unsafe extern "system" fn window_proc(
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
                     }
                     OPEN_HWND.store(hwnd.0 as isize, Ordering::Release);
+                    unsafe {
+                        let _ = SetTimer(Some(hwnd), ESC_CLOSE_TIMER_ID, ESC_CLOSE_POLL_MS, None);
+                    }
                     return LRESULT(1);
                 }
             }
             LRESULT(0)
         }
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             unsafe {
@@ -888,6 +1016,19 @@ unsafe extern "system" fn window_proc(
             if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
                 let x = (lparam.0 as u32 & 0xffff) as i16 as f32;
                 let y = ((lparam.0 as u32 >> 16) & 0xffff) as i16 as f32;
+                let width = app.client_size().width as f32;
+                if y <= HEADER_DRAG_HEIGHT && x >= WINDOW_MARGIN && x <= width - WINDOW_MARGIN {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                        SendMessageW(
+                            hwnd,
+                            WM_NCLBUTTONDOWN,
+                            Some(WPARAM(HTCAPTION as usize)),
+                            Some(LPARAM(0)),
+                        );
+                    }
+                    return LRESULT(0);
+                }
                 app.handle_click(x, y);
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -895,12 +1036,20 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_CLOSE => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
+        WM_TIMER => {
+            if wparam.0 == ESC_CLOSE_TIMER_ID {
+                if let Some(app) = unsafe { app_from_hwnd(hwnd) } {
+                    if app.should_close_for_escape() {
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                }
+                return LRESULT(0);
             }
-            LRESULT(0)
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        WM_CLOSE => LRESULT(0),
         WM_DESTROY => {
             unsafe {
                 PostQuitMessage(0);
@@ -909,6 +1058,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_NCDESTROY => {
             let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GuiApp };
+            unsafe {
+                let _ = KillTimer(Some(hwnd), ESC_CLOSE_TIMER_ID);
+            }
             if !raw.is_null() {
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -934,64 +1086,16 @@ unsafe fn app_from_hwnd(hwnd: HWND) -> Option<&'static mut GuiApp> {
 fn seed_cards() -> Vec<GuiCard> {
     vec![
         GuiCard {
-            category: Category::Combat,
-            name: "Aim Assist",
-            description: "Smooth target assistance preview.",
-            enabled: false,
-        },
-        GuiCard {
-            category: Category::Combat,
-            name: "Reach",
-            description: "Extended interaction display card.",
-            enabled: false,
-        },
-        GuiCard {
             category: Category::Other,
             name: "Fun",
             description: "Base module for other features.",
             enabled: true,
         },
         GuiCard {
-            category: Category::Other,
-            name: "Streamer Mode",
-            description: "Hide identifying overlay data.",
-            enabled: false,
-        },
-        GuiCard {
-            category: Category::Player,
-            name: "Inventory Move",
-            description: "Player movement utility placeholder.",
-            enabled: false,
-        },
-        GuiCard {
-            category: Category::Player,
-            name: "No Slow",
-            description: "Movement quality-of-life display.",
-            enabled: false,
-        },
-        GuiCard {
             category: Category::System,
             name: "ClickGui",
             description: "Rust Direct2D click interface.",
             enabled: true,
-        },
-        GuiCard {
-            category: Category::System,
-            name: "Config",
-            description: "Local configuration surface.",
-            enabled: false,
-        },
-        GuiCard {
-            category: Category::Visual,
-            name: "HUD",
-            description: "On-screen client information.",
-            enabled: false,
-        },
-        GuiCard {
-            category: Category::Visual,
-            name: "ESP",
-            description: "Visual module display card.",
-            enabled: false,
         },
     ]
 }
@@ -1008,23 +1112,30 @@ fn download_icon_to_cache() -> Option<PathBuf> {
         return Some(path);
     }
 
-    let url = wide_null(ICON_URL);
-    let dest = path_to_wide_null(&path);
-    let result = unsafe {
-        URLDownloadToFileW(
-            None::<&IUnknown>,
-            PCWSTR(url.as_ptr()),
-            PCWSTR(dest.as_ptr()),
-            0,
-            None::<&IBindStatusCallback>,
-        )
-    };
+    let download_path = path.clone();
+    let _ = thread::Builder::new()
+        .name("nyx-click-gui-icon".to_owned())
+        .spawn(move || {
+            let coinit = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            if coinit.is_err() {
+                return;
+            }
+            let _com_scope = ComScope;
 
-    if result.is_ok() && path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+            let url = wide_null(ICON_URL);
+            let dest = path_to_wide_null(&download_path);
+            let _ = unsafe {
+                URLDownloadToFileW(
+                    None::<&IUnknown>,
+                    PCWSTR(url.as_ptr()),
+                    PCWSTR(dest.as_ptr()),
+                    0,
+                    None::<&IBindStatusCallback>,
+                )
+            };
+        });
+
+    Some(path)
 }
 
 fn windows_username() -> String {
@@ -1046,6 +1157,10 @@ fn path_to_wide_null(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn is_escape_key_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) & KEY_STATE_DOWN_MASK != 0 }
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
