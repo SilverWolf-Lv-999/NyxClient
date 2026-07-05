@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
@@ -388,9 +388,9 @@ fn message_loop() {
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && wparam.0 as u32 == WM_MBUTTONDOWN {
         let hook_data = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if let Some(target_pid) = target_pid_for_taskbar_middle_click(hook_data.pt) {
+        if is_taskbar_app_point_fast(hook_data.pt) {
             set_suppress_middle_up();
-            spawn_kill(target_pid);
+            spawn_taskbar_middle_click_worker(hook_data.pt);
             return LRESULT(1);
         }
     }
@@ -421,36 +421,66 @@ fn take_suppress_middle_up() -> bool {
     suppress
 }
 
-fn target_pid_for_taskbar_middle_click(point: POINT) -> Option<u32> {
+fn spawn_taskbar_middle_click_worker(point: POINT) {
+    let point_x = point.x;
+    let point_y = point.y;
+    let _ = thread::Builder::new()
+        .name("nyx-fast-close-worker".to_owned())
+        .spawn(move || {
+            handle_taskbar_middle_click(POINT {
+                x: point_x,
+                y: point_y,
+            });
+        });
+}
+
+fn handle_taskbar_middle_click(point: POINT) {
+    let class_chain = class_chain_at_point(point);
     if !is_taskbar_point(point) {
         fast_close_debug_log(|| {
             format!(
                 "middle-click ignored: point {},{} is not on taskbar; class chain: {}",
                 point.x,
                 point.y,
-                class_chain_at_point(point).join(" -> ")
+                class_chain.join(" -> ")
             )
         });
-        return None;
+        return;
     }
 
     let explorer_pid = taskbar_explorer_pid_at_point(point).unwrap_or_default();
-    let target_pid = target_process_at_taskbar_point(point, explorer_pid)
-        .filter(|pid| *pid != 0 && *pid != unsafe { GetCurrentProcessId() })?;
+    let uia_names = uia_names_at_point(point);
+    let target_pids = target_processes_at_taskbar_point(point, explorer_pid, &uia_names)
+        .into_iter()
+        .filter(|pid| !is_ignored_target_pid(*pid, explorer_pid))
+        .collect::<Vec<_>>();
+
+    if !target_pids.is_empty() {
+        fast_close_debug_log(|| {
+            format!(
+                "taskbar middle-click: point {},{}, explorer_pid={}, target_pids={:?}, uia_names={:?}, class_chain={}",
+                point.x,
+                point.y,
+                explorer_pid,
+                target_pids,
+                uia_names,
+                class_chain.join(" -> ")
+            )
+        });
+        kill_targets(target_pids);
+        return;
+    }
 
     fast_close_debug_log(|| {
         format!(
-            "taskbar middle-click: point {},{}, explorer_pid={}, target_pid={}, uia_names={:?}, class_chain={}",
+            "middle-click suppressed without kill target at {},{}; explorer_pid={}, uia_names={:?}, class_chain={}",
             point.x,
             point.y,
             explorer_pid,
-            target_pid,
-            uia_names_at_point(point),
-            class_chain_at_point(point).join(" -> ")
+            uia_names,
+            class_chain.join(" -> ")
         )
     });
-
-    Some(target_pid)
 }
 
 fn clear_hook_context() {
@@ -462,40 +492,83 @@ fn clear_hook_context() {
     }
 }
 
-fn spawn_kill(target_pid: u32) {
+fn kill_targets(target_pids: Vec<u32>) {
     let settings = current_settings();
-    let _ = thread::Builder::new()
-        .name("nyx-fast-close-worker".to_owned())
-        .spawn(move || {
-            if let Err(error) =
-                process_utility::kill_process(target_pid, settings.level, settings.process_tree)
-            {
-                eprintln!("FastClose failed to terminate process {target_pid}: {error}");
+    let kill_pids = target_pids
+        .iter()
+        .copied()
+        .map(|target_pid| {
+            if settings.process_tree {
+                process_utility::process_tree_root_for_termination(target_pid)
+            } else {
+                target_pid
             }
-        });
+        })
+        .filter(|pid| *pid != 0)
+        .collect::<Vec<_>>();
+    let kill_pids = unique_pids(kill_pids);
+
+    fast_close_debug_log(|| {
+        format!(
+            "kill request: target_pids={:?}, kill_pids={:?}, level={:?}, process_tree={}",
+            target_pids, kill_pids, settings.level, settings.process_tree
+        )
+    });
+
+    let mut failures = Vec::new();
+    for kill_pid in kill_pids {
+        if let Err(error) =
+            process_utility::kill_process(kill_pid, settings.level, settings.process_tree)
+        {
+            failures.push(format!("{kill_pid}: {error}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        eprintln!(
+            "FastClose failed to terminate process target(s): {}",
+            failures.join("; ")
+        );
+    }
 }
 
 fn is_explorer_process(pid: u32) -> bool {
     process_utility::is_process_named(pid, "explorer.exe")
 }
 
-fn target_process_at_taskbar_point(point: POINT, explorer_pid: u32) -> Option<u32> {
-    if let Some(pid) = uia_native_target_pid(point, explorer_pid) {
-        return Some(pid);
+fn is_ignored_target_pid(pid: u32, explorer_pid: u32) -> bool {
+    pid == 0
+        || pid == explorer_pid
+        || pid == unsafe { GetCurrentProcessId() }
+        || is_explorer_process(pid)
+        || process_utility::is_protected_process(pid)
+}
+
+fn target_processes_at_taskbar_point(
+    point: POINT,
+    explorer_pid: u32,
+    uia_names: &[String],
+) -> Vec<u32> {
+    let native_pids = uia_native_target_pids(point, explorer_pid);
+    if !native_pids.is_empty() {
+        return native_pids;
     }
 
-    let names = uia_names_at_point(point);
-    if names.is_empty() {
-        return None;
+    if uia_names.is_empty() {
+        return Vec::new();
     }
 
     let windows = visible_window_candidates();
-    names
-        .iter()
-        .find_map(|name| match_taskbar_name_to_pid(name, &windows))
+    unique_pids(
+        uia_names
+            .iter()
+            .flat_map(|name| match_taskbar_name_to_pids(name, &windows))
+            .collect(),
+    )
 }
 
-fn uia_native_target_pid(point: POINT, explorer_pid: u32) -> Option<u32> {
+fn uia_native_target_pids(point: POINT, explorer_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
     walk_uia_elements_at_point(point, |element| {
         let hwnd = unsafe { element.CurrentNativeWindowHandle().ok()? };
         if hwnd.0.is_null() {
@@ -506,16 +579,12 @@ fn uia_native_target_pid(point: POINT, explorer_pid: u32) -> Option<u32> {
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
-        if pid == 0
-            || pid == explorer_pid
-            || pid == unsafe { GetCurrentProcessId() }
-            || is_explorer_process(pid)
-        {
-            None
-        } else {
-            Some(pid)
+        if !is_ignored_target_pid(pid, explorer_pid) && !pids.contains(&pid) {
+            pids.push(pid);
         }
-    })
+        None::<()>
+    });
+    pids
 }
 
 fn uia_names_at_point(point: POINT) -> Vec<String> {
@@ -564,9 +633,14 @@ fn walk_uia_elements_at_point<T>(
 struct WindowCandidate {
     pid: u32,
     title: String,
+    exe_name: String,
 }
 
 fn visible_window_candidates() -> Vec<WindowCandidate> {
+    let process_names = process_utility::snapshot_processes()
+        .into_iter()
+        .map(|entry| (entry.pid, entry.exe_name))
+        .collect::<HashMap<_, _>>();
     let mut candidates = Vec::<WindowCandidate>::new();
     unsafe {
         let _ = EnumWindows(
@@ -574,16 +648,21 @@ fn visible_window_candidates() -> Vec<WindowCandidate> {
             LPARAM((&mut candidates as *mut Vec<WindowCandidate>) as isize),
         );
     }
+    let current_pid = unsafe { GetCurrentProcessId() };
+    for candidate in &mut candidates {
+        candidate.exe_name = process_names
+            .get(&candidate.pid)
+            .cloned()
+            .unwrap_or_else(|| format!("pid-{}", candidate.pid));
+    }
+    candidates.retain(|candidate| {
+        candidate.pid != current_pid && !process_utility::is_protected_process(candidate.pid)
+    });
     candidates
 }
 
 unsafe extern "system" fn enum_visible_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
-        return true.into();
-    }
-
-    let title = window_text(hwnd);
-    if title.trim().is_empty() {
         return true.into();
     }
 
@@ -593,16 +672,20 @@ unsafe extern "system" fn enum_visible_windows_proc(hwnd: HWND, lparam: LPARAM) 
     }
     if pid != 0 {
         let candidates = unsafe { &mut *(lparam.0 as *mut Vec<WindowCandidate>) };
-        candidates.push(WindowCandidate { pid, title });
+        candidates.push(WindowCandidate {
+            pid,
+            title: window_text(hwnd),
+            exe_name: String::new(),
+        });
     }
 
     true.into()
 }
 
-fn match_taskbar_name_to_pid(taskbar_name: &str, windows: &[WindowCandidate]) -> Option<u32> {
+fn match_taskbar_name_to_pids(taskbar_name: &str, windows: &[WindowCandidate]) -> Vec<u32> {
     let names = taskbar_app_name_candidates(taskbar_name);
     if names.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     for name in &names {
@@ -611,8 +694,9 @@ fn match_taskbar_name_to_pid(taskbar_name: &str, windows: &[WindowCandidate]) ->
             .filter(|window| normalize_title(&window.title) == *name)
             .map(|window| window.pid)
             .collect::<Vec<_>>();
-        if let Some(pid) = unique_pid(&exact) {
-            return Some(pid);
+        let exact = unique_pids(exact);
+        if !exact.is_empty() {
+            return exact;
         }
     }
 
@@ -625,20 +709,17 @@ fn match_taskbar_name_to_pid(taskbar_name: &str, windows: &[WindowCandidate]) ->
             })
             .map(|window| window.pid)
             .collect::<Vec<_>>();
-        if let Some(pid) = unique_pid(&contains) {
-            return Some(pid);
+        let contains = unique_pids(contains);
+        if !contains.is_empty() {
+            return contains;
         }
     }
 
-    let process_entries = process_utility::snapshot_processes();
     for name in &names {
         let exe_matches = windows
             .iter()
             .filter_map(|window| {
-                let process = process_entries
-                    .iter()
-                    .find(|entry| entry.pid == window.pid)?;
-                let exe_stem = normalize_exe_stem(&process.exe_name);
+                let exe_stem = normalize_exe_stem(&window.exe_name);
                 if exe_stem.len() >= 3 && (name.contains(&exe_stem) || exe_stem.contains(name)) {
                     Some(window.pid)
                 } else {
@@ -646,25 +727,43 @@ fn match_taskbar_name_to_pid(taskbar_name: &str, windows: &[WindowCandidate]) ->
                 }
             })
             .collect::<Vec<_>>();
-        if let Some(pid) = unique_pid(&exe_matches) {
-            return Some(pid);
+        let exe_matches = unique_pids(exe_matches);
+        if !exe_matches.is_empty() {
+            return exe_matches;
         }
     }
 
-    None
+    let process_entries = process_utility::snapshot_processes();
+    for name in &names {
+        let process_matches = process_entries
+            .iter()
+            .filter_map(|process| {
+                if process_utility::is_protected_process_name(&process.exe_name) {
+                    return None;
+                }
+
+                let exe_stem = normalize_exe_stem(&process.exe_name);
+                if exe_stem.len() >= 3 && (name.contains(&exe_stem) || exe_stem.contains(name)) {
+                    Some(process.pid)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let process_matches = unique_pids(process_matches);
+        if !process_matches.is_empty() {
+            return process_matches;
+        }
+    }
+
+    Vec::new()
 }
 
-fn unique_pid(pids: &[u32]) -> Option<u32> {
-    let mut unique = pids
-        .iter()
-        .copied()
-        .filter(|pid| *pid != 0)
-        .collect::<HashSet<_>>();
-    if unique.len() == 1 {
-        unique.drain().next()
-    } else {
-        None
-    }
+fn unique_pids(pids: Vec<u32>) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    pids.into_iter()
+        .filter(|pid| *pid != 0 && seen.insert(*pid))
+        .collect()
 }
 
 fn taskbar_app_name_candidates(name: &str) -> Vec<String> {
@@ -680,6 +779,56 @@ fn taskbar_app_name_candidates(name: &str) -> Vec<String> {
     candidates
 }
 
+fn is_taskbar_app_point_fast(point: POINT) -> bool {
+    let hwnd = unsafe { WindowFromPoint(point) };
+    if hwnd.0.is_null() {
+        return false;
+    }
+
+    let mut saw_taskbar_shell = false;
+    let mut saw_app_surface = false;
+    visit_window_class_chain(hwnd, |class_name| {
+        saw_taskbar_shell |= is_taskbar_shell_class(class_name);
+        saw_app_surface |= is_taskbar_app_surface_class(class_name);
+    });
+
+    saw_taskbar_shell && saw_app_surface
+}
+
+fn visit_window_class_chain(hwnd: HWND, mut visit: impl FnMut(&str)) {
+    let mut current = hwnd;
+    for _ in 0..16 {
+        let current_class = class_name(current);
+        visit(&current_class);
+
+        match unsafe { GetParent(current) } {
+            Ok(parent) if !parent.0.is_null() => current = parent,
+            _ => break,
+        }
+    }
+
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if !root.0.is_null() && root != hwnd {
+        let root_class = class_name(root);
+        visit(&root_class);
+    }
+}
+
+fn is_taskbar_shell_class(class_name: &str) -> bool {
+    matches!(class_name, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+fn is_taskbar_app_surface_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "MSTaskSwWClass"
+            | "MSTaskListWClass"
+            | "TaskListThumbnailWnd"
+            | "Windows.UI.Composition.DesktopWindowContentBridge"
+            | "XamlExplorerHostIslandWindow"
+    )
+}
+
 fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     if candidate.len() >= 2 && !candidates.iter().any(|existing| existing == &candidate) {
         candidates.push(candidate);
@@ -693,14 +842,29 @@ fn clean_taskbar_app_name(name: &str) -> String {
         "running window",
         "open windows",
         "open window",
+        "button",
+        "taskbar",
+        "pinned",
+        "unpinned",
+        "pin to taskbar",
+        "unpin from taskbar",
         "windows",
         "window",
         "running",
         "opened",
         "open",
+        "按钮",
+        "任务栏",
+        "固定到任务栏",
+        "从任务栏取消固定",
+        "已固定",
+        "取消固定",
         "正在运行的窗口",
         "正在运行窗口",
         "正在运行",
+        "运行窗口",
+        "运行的窗口",
+        "运行",
         "已打开的窗口",
         "已打开窗口",
         "已打开",
@@ -964,9 +1128,12 @@ fn window_text(hwnd: HWND) -> String {
 }
 
 fn fast_close_debug_log(message: impl FnOnce() -> String) {
-    if std::env::var_os("NYX_FAST_CLOSE_DEBUG").is_some()
-        || std::env::var_os("NYX_SUPER_KILL_DEBUG").is_some()
-    {
+    if fast_close_debug_enabled() {
         eprintln!("FastClose debug: {}", message());
     }
+}
+
+fn fast_close_debug_enabled() -> bool {
+    std::env::var_os("NYX_FAST_CLOSE_DEBUG").is_some()
+        || std::env::var_os("NYX_SUPER_KILL_DEBUG").is_some()
 }

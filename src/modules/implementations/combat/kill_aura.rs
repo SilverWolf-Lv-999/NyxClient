@@ -7,7 +7,8 @@ use std::{
 use crate::{
     modules::{BaseValue, Category, Module, ModuleInfo, ModuleState},
     utility::process_utility::{
-        ProcessSnapshotEntry, force_terminate_process_tree, snapshot_processes,
+        ProcessSnapshotEntry, force_terminate_process_tree, is_protected_process_name,
+        snapshot_processes,
     },
 };
 use windows::{
@@ -500,20 +501,6 @@ fn is_ignored_window_class(class_name: &str) -> bool {
             | "shell_secondarytraywnd"
             | "mstasklistwclass"
             | "tasklistthumbnailwnd"
-    )
-}
-
-fn is_protected_process_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "explorer.exe"
-            | "shellexperiencehost.exe"
-            | "startmenuexperiencehost.exe"
-            | "searchhost.exe"
-            | "textinputhost.exe"
-            | "applicationframehost.exe"
-            | "dwm.exe"
-            | "ctfmon.exe"
     )
 }
 

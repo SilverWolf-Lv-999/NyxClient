@@ -19,8 +19,7 @@ use windows::{
             },
             Threading::{
                 GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-                TerminateProcess, WaitForSingleObject,
+                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
             },
         },
         UI::WindowsAndMessaging::{
@@ -124,13 +123,17 @@ pub fn taskkill_process(pid: u32, process_tree: bool) -> Result<(), String> {
     }
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let status = command
-        .status()
+    let output = command
+        .output()
         .map_err(|error| format!("failed to start taskkill.exe: {error}"))?;
-    if status.success() {
+    if output.status.success() || process_target_is_gone(pid, process_tree) {
         Ok(())
     } else {
-        Err(format!("taskkill.exe exited with {status}"))
+        Err(format!(
+            "taskkill.exe exited with {}{}",
+            output.status,
+            command_output_details(&output.stdout, &output.stderr)
+        ))
     }
 }
 
@@ -152,6 +155,10 @@ pub fn force_terminate_process_tree(root_pid: u32) -> Result<(), String> {
 
 pub fn collect_process_tree(root_pid: u32) -> Vec<u32> {
     let entries = snapshot_processes();
+    let existing = entries
+        .iter()
+        .map(|entry| entry.pid)
+        .collect::<HashSet<_>>();
     let mut children = HashMap::<u32, Vec<u32>>::new();
     for entry in entries {
         children
@@ -162,8 +169,21 @@ pub fn collect_process_tree(root_pid: u32) -> Vec<u32> {
 
     let mut ordered = Vec::new();
     let mut visited = HashSet::new();
-    append_process_tree(root_pid, &children, &mut visited, &mut ordered);
+    append_process_tree(root_pid, &children, &existing, &mut visited, &mut ordered);
     ordered
+}
+
+pub fn process_tree_root_for_termination(pid: u32) -> u32 {
+    let process_entries = snapshot_processes()
+        .into_iter()
+        .map(|entry| (entry.pid, entry))
+        .collect::<HashMap<_, _>>();
+
+    process_tree_root_for_termination_from_snapshot(
+        pid,
+        unsafe { GetCurrentProcessId() },
+        &process_entries,
+    )
 }
 
 pub fn snapshot_processes() -> Vec<ProcessSnapshotEntry> {
@@ -205,8 +225,47 @@ pub fn process_name(pid: u32) -> Option<String> {
         .map(|entry| entry.exe_name)
 }
 
+pub fn process_exists(pid: u32) -> bool {
+    snapshot_processes()
+        .into_iter()
+        .any(|entry| entry.pid == pid)
+}
+
 pub fn is_process_named(pid: u32, name: &str) -> bool {
     process_name(pid).is_some_and(|exe_name| exe_name.eq_ignore_ascii_case(name))
+}
+
+pub fn is_protected_process(pid: u32) -> bool {
+    process_name(pid).is_some_and(|exe_name| is_protected_process_name(&exe_name))
+}
+
+pub fn is_protected_process_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "system"
+            | "idle"
+            | "registry"
+            | "secure system"
+            | "smss.exe"
+            | "csrss.exe"
+            | "wininit.exe"
+            | "winlogon.exe"
+            | "services.exe"
+            | "lsass.exe"
+            | "lsaiso.exe"
+            | "fontdrvhost.exe"
+            | "dwm.exe"
+            | "ctfmon.exe"
+            | "sihost.exe"
+            | "explorer.exe"
+            | "shellexperiencehost.exe"
+            | "startmenuexperiencehost.exe"
+            | "searchhost.exe"
+            | "searchindexer.exe"
+            | "textinputhost.exe"
+            | "applicationframehost.exe"
+            | "runtimebroker.exe"
+    )
 }
 
 fn selected_process_ids(root_pid: u32, process_tree: bool) -> Vec<u32> {
@@ -221,6 +280,9 @@ fn terminate_processes(pids: &[u32]) -> Result<(), String> {
     let current_pid = unsafe { GetCurrentProcessId() };
     let mut failures = Vec::new();
     for pid in pids.iter().copied().filter(|pid| *pid != current_pid) {
+        if is_protected_process(pid) {
+            continue;
+        }
         if let Err(error) = terminate_process_unchecked(pid) {
             failures.push(format!("{pid}: {error}"));
         }
@@ -234,13 +296,20 @@ fn terminate_processes(pids: &[u32]) -> Result<(), String> {
 }
 
 fn terminate_process_unchecked(pid: u32) -> Result<(), String> {
-    let access = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-    let handle = unsafe { OpenProcess(access, false, pid) }
-        .map_err(|error| format!("OpenProcess failed: {error}"))?;
+    let access = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
+    let handle = match unsafe { OpenProcess(access, false, pid) } {
+        Ok(handle) => handle,
+        Err(_error) if !process_exists(pid) => return Ok(()),
+        Err(error) => return Err(format!("OpenProcess failed: {error}")),
+    };
     let handle = OwnedHandle(handle);
 
-    unsafe { TerminateProcess(handle.0, TERMINATE_EXIT_CODE) }
-        .map_err(|error| format!("TerminateProcess failed: {error}"))?;
+    if let Err(error) = unsafe { TerminateProcess(handle.0, TERMINATE_EXIT_CODE) } {
+        if !process_exists(pid) {
+            return Ok(());
+        }
+        return Err(format!("TerminateProcess failed: {error}"));
+    }
     unsafe {
         let _ = WaitForSingleObject(handle.0, TERMINATE_WAIT_MS);
     }
@@ -287,16 +356,100 @@ fn enable_debug_privilege() -> Result<(), String> {
 }
 
 fn ensure_target_pid(pid: u32) -> Result<(), String> {
-    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
-        Err("refusing to terminate the current process".to_owned())
-    } else {
-        Ok(())
+    if pid == 0 {
+        return Err("refusing to terminate pid 0".to_owned());
     }
+    if pid == unsafe { GetCurrentProcessId() } {
+        return Err("refusing to terminate the current process".to_owned());
+    }
+    if let Some(name) = process_name(pid)
+        && is_protected_process_name(&name)
+    {
+        return Err(format!(
+            "refusing to terminate protected Windows process {name} (pid {pid})"
+        ));
+    }
+
+    Ok(())
+}
+
+fn process_target_is_gone(pid: u32, process_tree: bool) -> bool {
+    if process_tree {
+        collect_process_tree(pid).is_empty()
+    } else {
+        !process_exists(pid)
+    }
+}
+
+fn command_output_details(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(": {stdout}"),
+        (true, false) => format!(": {stderr}"),
+        (false, false) => format!(": {stderr}; stdout: {stdout}"),
+    }
+}
+
+fn process_tree_root_for_termination_from_snapshot(
+    pid: u32,
+    current_pid: u32,
+    process_entries: &HashMap<u32, ProcessSnapshotEntry>,
+) -> u32 {
+    let mut selected_pid = pid;
+    let mut cursor_pid = pid;
+    let mut visited = HashSet::new();
+
+    for _ in 0..16 {
+        if !visited.insert(cursor_pid) {
+            break;
+        }
+
+        let Some(entry) = process_entries.get(&cursor_pid) else {
+            break;
+        };
+        let parent_pid = entry.parent_pid;
+        if parent_pid == 0 || parent_pid == current_pid || parent_pid == cursor_pid {
+            break;
+        }
+
+        let Some(parent) = process_entries.get(&parent_pid) else {
+            break;
+        };
+        if is_protected_process_name(&parent.exe_name) {
+            break;
+        }
+
+        if is_command_or_script_host_name(&parent.exe_name) {
+            selected_pid = parent_pid;
+            cursor_pid = parent_pid;
+        } else {
+            break;
+        }
+    }
+
+    selected_pid
+}
+
+fn is_command_or_script_host_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "cmd.exe"
+            | "powershell.exe"
+            | "pwsh.exe"
+            | "wscript.exe"
+            | "cscript.exe"
+            | "mshta.exe"
+            | "conhost.exe"
+    )
 }
 
 fn append_process_tree(
     pid: u32,
     children: &HashMap<u32, Vec<u32>>,
+    existing: &HashSet<u32>,
     visited: &mut HashSet<u32>,
     ordered: &mut Vec<u32>,
 ) {
@@ -306,10 +459,12 @@ fn append_process_tree(
 
     if let Some(child_pids) = children.get(&pid) {
         for child in child_pids {
-            append_process_tree(*child, children, visited, ordered);
+            append_process_tree(*child, children, existing, visited, ordered);
         }
     }
-    ordered.push(pid);
+    if existing.contains(&pid) {
+        ordered.push(pid);
+    }
 }
 
 struct CloseWindowContext {
@@ -353,4 +508,70 @@ fn wide_z_to_string(buffer: &[u16]) -> String {
         .position(|ch| *ch == 0)
         .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process_entries(entries: &[(u32, u32, &str)]) -> HashMap<u32, ProcessSnapshotEntry> {
+        entries
+            .iter()
+            .map(|(pid, parent_pid, exe_name)| {
+                (
+                    *pid,
+                    ProcessSnapshotEntry {
+                        pid: *pid,
+                        parent_pid: *parent_pid,
+                        exe_name: (*exe_name).to_owned(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn termination_root_climbs_to_command_host_parent() {
+        let entries = process_entries(&[
+            (10, 0, "explorer.exe"),
+            (20, 10, "powershell.exe"),
+            (30, 20, "conhost.exe"),
+            (40, 30, "child.exe"),
+        ]);
+
+        assert_eq!(
+            process_tree_root_for_termination_from_snapshot(40, 99, &entries),
+            20
+        );
+    }
+
+    #[test]
+    fn termination_root_stops_at_protected_parent() {
+        let entries = process_entries(&[(10, 0, "explorer.exe"), (20, 10, "app.exe")]);
+
+        assert_eq!(
+            process_tree_root_for_termination_from_snapshot(20, 99, &entries),
+            20
+        );
+    }
+
+    #[test]
+    fn termination_root_does_not_climb_to_regular_parent() {
+        let entries = process_entries(&[(10, 0, "launcher.exe"), (20, 10, "app.exe")]);
+
+        assert_eq!(
+            process_tree_root_for_termination_from_snapshot(20, 99, &entries),
+            20
+        );
+    }
+
+    #[test]
+    fn termination_root_stops_at_current_process() {
+        let entries = process_entries(&[(10, 0, "cmd.exe"), (20, 10, "app.exe")]);
+
+        assert_eq!(
+            process_tree_root_for_termination_from_snapshot(20, 10, &entries),
+            20
+        );
+    }
 }
