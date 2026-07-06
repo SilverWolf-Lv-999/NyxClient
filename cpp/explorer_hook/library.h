@@ -1,0 +1,6 @@
+#ifndef EXPLORER_HOOK_LIBRARY_H
+#define EXPLORER_HOOK_LIBRARY_H
+
+void hello();
+
+#endif // EXPLORER_HOOK_LIBRARY_H
