@@ -14,7 +14,10 @@ mod tray_icon;
 
 use nyx_client::modules::implementations::{
     player::fast_close::set_shared_module_handler as set_fast_close_shared_module_handler,
-    system::click_gui::set_shared_module_handler,
+    system::{
+        click_gui::set_shared_module_handler,
+        stage_manager::set_shared_module_handler as set_stage_manager_shared_module_handler,
+    },
     visual::live2d::set_shared_module_handler as set_live2d_shared_module_handler,
 };
 use nyx_client::{
@@ -145,8 +148,10 @@ fn main() -> Result<(), String> {
     let event_bus = EventBus::shared();
     let modules = Arc::new(Mutex::new(module_handler));
     set_shared_module_handler(Arc::clone(&modules));
+    set_stage_manager_shared_module_handler(Arc::clone(&modules));
     set_live2d_shared_module_handler(Arc::clone(&modules));
     set_fast_close_shared_module_handler(Arc::clone(&modules));
+    enable_better_touchpad_hook(&modules);
     enable_fast_close_hook(&modules);
     let running = Arc::new(AtomicBool::new(true));
     let pressed_bind_keys = Arc::new(Mutex::new(HashSet::new()));
@@ -189,6 +194,13 @@ fn enable_fast_close_hook(modules: &Arc<Mutex<ModuleHandler>>) {
         return;
     };
     let _ = modules.set_enabled("FastClose", true);
+}
+
+fn enable_better_touchpad_hook(modules: &Arc<Mutex<ModuleHandler>>) {
+    let Ok(mut modules) = modules.lock() else {
+        return;
+    };
+    let _ = modules.set_enabled("BetterTouchpad", true);
 }
 
 fn load_default_config(module_handler: &mut ModuleHandler) {
