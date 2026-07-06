@@ -1,0 +1,6 @@
+#ifndef TOUCHPAD_HOOK_LIBRARY_H
+#define TOUCHPAD_HOOK_LIBRARY_H
+
+void hello();
+
+#endif // TOUCHPAD_HOOK_LIBRARY_H
